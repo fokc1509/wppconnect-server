@@ -19,6 +19,15 @@ import { Request, Response } from 'express';
 import { contactToArray, unlinkAsync } from '../util/functions';
 import { clientsArray } from '../util/sessionUtil';
 
+
+import axios from 'axios';
+import { createWriteStream, mkdtempSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { pipeline } from 'node:stream/promises';
+import { randomUUID } from 'crypto';
+
+
 function returnSucess(res: any, session: any, phone: any, data: any) {
   res.status(201).json({
     status: 'Success',
@@ -2212,36 +2221,61 @@ export async function getVotes(req: Request, res: Response) {
       .json({ status: 'error', message: 'Error on get votes', error: error });
   }
 }
+
+async function downloadToTemp(opts: {
+  url: string;
+  filename?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+}) {
+  const { url, filename, headers, timeoutMs = 120000 } = opts;
+
+  const resp = await axios({
+    method: 'GET',
+    url,
+    responseType: 'stream',
+    timeout: timeoutMs,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+    headers,
+    validateStatus: (s) => s >= 200 && s < 400, // aceita redirects
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
+  const name =
+    filename ||
+    url.split('?')[0].split('/').pop() ||
+    `file-${randomUUID()}`;
+  const filePath = join(dir, name);
+
+  await pipeline(resp.data, createWriteStream(filePath));
+
+  const contentType = resp.headers['content-type'] || '';
+  return {
+    filePath,
+    filename: name,
+    contentType,
+    cleanup: () => {
+      try {
+        unlinkSync(filePath);
+      } catch {}
+    },
+  };
+}
+
 export async function chatWoot(req: Request, res: Response): Promise<any> {
   /**
      #swagger.tags = ["Misc"]
      #swagger.description = 'You can point your Chatwoot to this route so that it can perform functions.'
      #swagger.autoBody=false
-     #swagger.security = [{
-            "bearerAuth": []
-     }]
-     #swagger.parameters["session"] = {
-      schema: 'NERDWHATS_AMERICA'
-     }
+     #swagger.security = [{ "bearerAuth": [] }]
+     #swagger.parameters["session"] = { schema: 'NERDWHATS_AMERICA' }
      #swagger.requestBody = {
       required: true,
       "@content": {
         "application/json": {
-          schema: {
-            type: "object",
-            properties: {
-              event: { type: "string" },
-              private: { type: "string" },
-            }
-          },
-          examples: {
-            "Default": {
-              value: {
-                messageId: "conversation_status_changed",
-                private: "false",
-              }
-            },
-          }
+          schema: { type: "object", properties: { event: { type: "string" }, private: { type: "string" } } },
+          examples: { "Default": { value: { messageId: "conversation_status_changed", private: "false" } } }
         }
       }
      }
@@ -2305,22 +2339,24 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
         const du = att?.data_url;
         if (typeof du !== 'string') return null;
 
-        // se já vier http(s), usa
-        if (/^https?:\/\//i.test(du)) return du;
+        if (/^https?:\/\//i.test(du)) return du; // já é URL absoluta
+        if (du.startsWith('/')) return `${baseURL}${du}`; // path absoluto
 
-        // se vier como path (/rails/...), monta com baseURL
-        if (du.startsWith('/')) return `${baseURL}${du}`;
-
-        // se contiver '/rails/' no meio, extrai e monta
         const railsIdx = du.indexOf('/rails/');
         if (railsIdx >= 0) return `${baseURL}${du.substring(railsIdx)}`;
 
-        // se começar com 'data:' é base64 -> não usar
-        if (du.startsWith('data:')) return null;
+        if (du.startsWith('data:')) return null; // base64 -> ignorar
 
-        // caso seja um path relativo sem slash inicial
-        return `${baseURL}/${du.replace(/^\/+/, '')}`;
+        return `${baseURL}/${du.replace(/^\/+/, '')}`; // path relativo
       };
+
+      // headers opcionais para baixar do Chatwoot (caso a URL exija auth)
+      const cwToken =
+        client?.config?.chatWoot?.token ||
+        client?.config?.chatWoot?.accessToken ||
+        null;
+      const cwAuthHeaderName =
+        client?.config?.chatWoot?.authHeaderName || 'Authorization';
 
       for (const contato of contactToArray(phone, false)) {
         if (message_type == 'outgoing') {
@@ -2329,24 +2365,45 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
             const att = atts[0]; // mantendo seu comportamento atual (primeiro anexo)
             const fileUrl = resolveAttachmentUrl(att);
 
-            // legenda assinada apenas se houver texto
             const signedCaption =
               message?.content && message.content.trim().length > 0
                 ? makeSigned(message.content)
                 : (message?.content || '');
 
             if (!fileUrl) {
-              // sem URL válida (só viria base64) -> por ora envia texto avisando
               const warnText = makeSigned('Não foi possível resolver a URL do anexo.');
               await client.sendText(contato, warnText);
               continue;
             }
 
-            if (att?.file_type === 'audio') {
-              await client.sendPtt(`${contato}`, fileUrl, 'Voice Audio', signedCaption);
-            } else {
-              // mantém filename/mime do seu fluxo atual (não alterar mime type)
-              await client.sendFile(`${contato}`, fileUrl, att?.filename || 'file', signedCaption);
+            // só envia header de auth se a URL pertence ao mesmo host do Chatwoot
+            const sendAuth =
+              baseURL && typeof fileUrl === 'string' && fileUrl.startsWith(baseURL) && cwToken;
+
+            const headers: Record<string, string> | undefined = sendAuth
+              ? {
+                  [cwAuthHeaderName]:
+                    cwAuthHeaderName.toLowerCase() === 'authorization'
+                      ? `Bearer ${cwToken}`
+                      : String(cwToken),
+                }
+              : undefined;
+
+            // ↓↓↓ baixa para arquivo temporário e envia por PATH local
+            const { filePath, filename, cleanup } = await downloadToTemp({
+              url: fileUrl,
+              filename: att?.filename,
+              headers,
+            });
+
+            try {
+              if (att?.file_type === 'audio') {
+                await client.sendPtt(`${contato}`, filePath, filename || 'Voice Audio', signedCaption);
+              } else {
+                await client.sendFile(`${contato}`, filePath, filename || 'file', signedCaption);
+              }
+            } finally {
+              cleanup();
             }
           } else {
             const signedText = makeSigned(message?.content || '');
@@ -2369,6 +2426,9 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
     });
   }
 }
+
+
+
 export async function getPlatformFromMessage(req: Request, res: Response) {
   /**
    * #swagger.tags = ["Misc"]
