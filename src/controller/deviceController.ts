@@ -2246,9 +2246,10 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
       }
      }
    */
-  const { session } = req.params;
+ const { session } = req.params;
   const client: any = clientsArray[session];
   if (client == null || client.status !== 'CONNECTED') return;
+
   try {
     if (await client.isConnected()) {
       const event = req.body.event;
@@ -2259,60 +2260,80 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
         event == 'conversation_resolved' ||
         is_private
       ) {
-        return res
-          .status(200)
-          .json({ status: 'success', message: 'Success on receive chatwoot' });
+        return res.status(200).json({
+          status: 'success',
+          message: 'Success on receive chatwoot'
+        });
       }
 
       const {
         message_type,
-        phone = req.body.conversation.meta.sender.phone_number.replace('+', ''),
-        message = req.body.conversation.messages[0],
+        phone = req.body.conversation?.meta?.sender?.phone_number?.replace('+', ''),
+        message = req.body.conversation?.messages?.[0],
       } = req.body;
 
-      if (event != 'message_created' && message_type != 'outgoing')
-        return res
-          .status(200)
-          .json({ status: 'success', message: 'Success on receive chatwoot' });
+      if (event != 'message_created' && message_type != 'outgoing') {
+        return res.status(200).json({
+          status: 'success',
+          message: 'Success on receive chatwoot'
+        });
+      }
+
+      // ===== NOVO: assinatura =====
+      const agentName =
+        req.body?.message?.sender?.name ||
+        message?.sender?.name ||
+        req.body?.user?.name ||
+        req.body?.sender?.name ||
+        null;
+
+      const signDelimiter = '\n';
+
+      const makeSigned = (text?: string) => {
+        if (!agentName) return text ?? '';
+        const prefix = `*${agentName}:*`; // negrito no WhatsApp
+        return (text && text.length > 0)
+          ? `${prefix}${signDelimiter}${text}`
+          : `${prefix}`;
+      };
+      // ============================
+
       for (const contato of contactToArray(phone, false)) {
         if (message_type == 'outgoing') {
-          if (message.attachments) {
-            const base_url = `${
-              client.config.chatWoot.baseURL
-            }/${message.attachments[0].data_url.substring(
+          if (message?.attachments) {
+            const base_url = `${client.config.chatWoot.baseURL}/${message.attachments[0].data_url.substring(
               message.attachments[0].data_url.indexOf('/rails/') + 1
             )}`;
 
-            // Check if attachments is Push-to-talk and send this
+            // legenda assinada apenas se houver texto
+            const signedCaption =
+              message?.content && message.content.trim().length > 0
+                ? makeSigned(message.content)
+                : message.content || '';
+
             if (message.attachments[0].file_type === 'audio') {
-              await client.sendPtt(
-                `${contato}`,
-                base_url,
-                'Voice Audio',
-                message.content
-              );
+              await client.sendPtt(`${contato}`, base_url, 'Voice Audio', signedCaption);
             } else {
-              await client.sendFile(
-                `${contato}`,
-                base_url,
-                'file',
-                message.content
-              );
+              await client.sendFile(`${contato}`, base_url, 'file', signedCaption);
             }
           } else {
-            await client.sendText(contato, message.content);
+            // texto puro sempre assinado
+            const signedText = makeSigned(message?.content || '');
+            await client.sendText(contato, signedText);
           }
         }
       }
-      res
-        .status(200)
-        .json({ status: 'success', message: 'Success on  receive chatwoot' });
+
+      res.status(200).json({
+        status: 'success',
+        message: 'Success on receive chatwoot'
+      });
     }
   } catch (e) {
     console.log(e);
     res.status(400).json({
       status: 'error',
-      message: 'Error on  receive chatwoot',
+      message: 'Error on receive chatwoot',
       error: e,
     });
   }
