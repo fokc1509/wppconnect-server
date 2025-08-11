@@ -2246,7 +2246,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
       }
      }
    */
- const { session } = req.params;
+  const { session } = req.params;
   const client: any = clientsArray[session];
   if (client == null || client.status !== 'CONNECTED') return;
 
@@ -2279,7 +2279,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
         });
       }
 
-      // ===== NOVO: assinatura =====
+      // ===== assinatura =====
       const agentName =
         req.body?.message?.sender?.name ||
         message?.sender?.name ||
@@ -2288,50 +2288,81 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
         null;
 
       const signDelimiter = '\n';
-
       const makeSigned = (text?: string) => {
         if (!agentName) return text ?? '';
-        const prefix = `*${agentName}:*`; // negrito no WhatsApp
-        return (text && text.length > 0)
-          ? `${prefix}${signDelimiter}${text}`
-          : `${prefix}`;
+        const prefix = `*${agentName}:*`;
+        return (text && text.length > 0) ? `${prefix}${signDelimiter}${text}` : `${prefix}`;
       };
-      // ============================
+      // ======================
+
+      // helper: resolve URL de anexo (nunca retorna base64)
+      const baseURL = (client?.config?.chatWoot?.baseURL || '').replace(/\/+$/, '');
+      const resolveAttachmentUrl = (att: any): string | null => {
+        const downloadUrl = att?.download_url || att?.downloadUrl || att?.url;
+        if (typeof downloadUrl === 'string' && /^https?:\/\//i.test(downloadUrl)) {
+          return downloadUrl;
+        }
+        const du = att?.data_url;
+        if (typeof du !== 'string') return null;
+
+        // se já vier http(s), usa
+        if (/^https?:\/\//i.test(du)) return du;
+
+        // se vier como path (/rails/...), monta com baseURL
+        if (du.startsWith('/')) return `${baseURL}${du}`;
+
+        // se contiver '/rails/' no meio, extrai e monta
+        const railsIdx = du.indexOf('/rails/');
+        if (railsIdx >= 0) return `${baseURL}${du.substring(railsIdx)}`;
+
+        // se começar com 'data:' é base64 -> não usar
+        if (du.startsWith('data:')) return null;
+
+        // caso seja um path relativo sem slash inicial
+        return `${baseURL}/${du.replace(/^\/+/, '')}`;
+      };
 
       for (const contato of contactToArray(phone, false)) {
         if (message_type == 'outgoing') {
-          if (message?.attachments) {
-            const base_url = `${client.config.chatWoot.baseURL}/${message.attachments[0].data_url.substring(
-              message.attachments[0].data_url.indexOf('/rails/') + 1
-            )}`;
+          const atts = Array.isArray(message?.attachments) ? message.attachments : [];
+          if (atts.length > 0) {
+            const att = atts[0]; // mantendo seu comportamento atual (primeiro anexo)
+            const fileUrl = resolveAttachmentUrl(att);
 
             // legenda assinada apenas se houver texto
             const signedCaption =
               message?.content && message.content.trim().length > 0
                 ? makeSigned(message.content)
-                : message.content || '';
+                : (message?.content || '');
 
-            if (message.attachments[0].file_type === 'audio') {
-              await client.sendPtt(`${contato}`, base_url, 'Voice Audio', signedCaption);
+            if (!fileUrl) {
+              // sem URL válida (só viria base64) -> por ora envia texto avisando
+              const warnText = makeSigned('Não foi possível resolver a URL do anexo.');
+              await client.sendText(contato, warnText);
+              continue;
+            }
+
+            if (att?.file_type === 'audio') {
+              await client.sendPtt(`${contato}`, fileUrl, 'Voice Audio', signedCaption);
             } else {
-              await client.sendFile(`${contato}`, base_url, 'file', signedCaption);
+              // mantém filename/mime do seu fluxo atual (não alterar mime type)
+              await client.sendFile(`${contato}`, fileUrl, att?.filename || 'file', signedCaption);
             }
           } else {
-            // texto puro sempre assinado
             const signedText = makeSigned(message?.content || '');
             await client.sendText(contato, signedText);
           }
         }
       }
 
-      res.status(200).json({
+      return res.status(200).json({
         status: 'success',
         message: 'Success on receive chatwoot'
       });
     }
   } catch (e) {
     console.log(e);
-    res.status(400).json({
+    return res.status(400).json({
       status: 'error',
       message: 'Error on receive chatwoot',
       error: e,
