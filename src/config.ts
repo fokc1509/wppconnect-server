@@ -44,6 +44,8 @@ export default {
     logger: ['console', 'file'],
   },
   createOptions: {
+    autoClose: 120000,
+    disableWelcome: true,
     browserArgs: [
       '--disable-web-security',
       '--no-sandbox',
@@ -69,6 +71,9 @@ export default {
       '--ignore-ssl-errors',
       '--ignore-certificate-errors-spki-list',
     ],
+    puppeteerOptions: {
+      protocolTimeout: 120000 // 2 minutos
+    },
     /**
      * Example of configuring the linkPreview generator
      * If you set this to 'null', it will use global servers; however, you have the option to define your own server
