@@ -2,6 +2,7 @@ version: "3"
 
 services:
   wppconnect:
+    shm_size: "1gb"
     container_name: wpp-server
     restart: unless-stopped
     build:
