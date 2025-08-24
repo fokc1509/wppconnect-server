@@ -26,6 +26,37 @@ import { join } from 'path';
 import { pipeline } from 'node:stream/promises';
 import { randomUUID } from 'crypto';
 
+// === helpers de filename (adicione uma vez neste arquivo) ===
+const CT_TO_EXT: Record<string, string> = {
+  'video/mp4': '.mp4',
+  'video/3gpp': '.3gp',
+  'video/quicktime': '.mov',
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'audio/ogg': '.ogg',
+  'audio/opus': '.opus',
+  'audio/mpeg': '.mp3',
+  'application/pdf': '.pdf',
+};
+
+function ensureFilenameWithExt(
+  name?: string,
+  contentType?: string,
+  fallback: string = 'file'
+): string {
+  let base = (name && name.trim()) || fallback;
+  const hasExt = /\.[a-z0-9]{2,5}$/i.test(base);
+  if (!hasExt) {
+    const ct = (contentType || '').toLowerCase();
+    const ext = CT_TO_EXT[ct] || '';
+    if (ext && !base.toLowerCase().endsWith(ext)) {
+      base += ext;
+    }
+  }
+  return base;
+}
+
 function returnSucess(res: any, session: any, phone: any, data: any) {
   res.status(201).json({
     status: 'Success',
