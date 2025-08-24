@@ -2467,14 +2467,17 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
       }
     });
   } catch (e: any) {
-    // mesmo em erro, tente não deixar o Chatwoot sem ACK
-    try {
-      req.logger?.error?.(e);
-    } catch {}
-    if (!res.headersSent) {
-      return res.status(200).json({ status: 'accepted_with_error', error: String(msg) });
-    }
+  try {
+    req.logger?.error?.(e);
+  } catch {}
+  if (!res.headersSent) {
+    const errMsg =
+      e && typeof e === 'object' && 'message' in e ? (e as any).message : String(e);
+    return res
+      .status(200)
+      .json({ status: 'accepted_with_error', error: String(errMsg) });
   }
+ }
 }
 
 export async function getPlatformFromMessage(req: Request, res: Response) {
