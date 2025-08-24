@@ -2459,20 +2459,20 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
         }
 
         markProcessed(cwMsgId);
-      } catch (err) {
+      } catch (err: any) {
         try {
           req.logger?.error?.(err);
         } catch {}
         console.error('chatWoot async send error:', err);
       }
     });
-  } catch (e) {
+  } catch (e: any) {
     // mesmo em erro, tente não deixar o Chatwoot sem ACK
     try {
       req.logger?.error?.(e);
     } catch {}
     if (!res.headersSent) {
-      return res.status(200).json({ status: 'accepted_with_error', error: String(e?.message || e) });
+      return res.status(200).json({ status: 'accepted_with_error', error: String(msg) });
     }
   }
 }
