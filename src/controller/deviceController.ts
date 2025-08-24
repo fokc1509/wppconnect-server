@@ -19,6 +19,7 @@ import { Request, Response } from 'express';
 import { contactToArray, unlinkAsync } from '../util/functions';
 import { clientsArray } from '../util/sessionUtil';
 
+
 import axios from 'axios';
 import { createWriteStream, mkdtempSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
@@ -26,36 +27,6 @@ import { join } from 'path';
 import { pipeline } from 'node:stream/promises';
 import { randomUUID } from 'crypto';
 
-// === helpers de filename (adicione uma vez neste arquivo) ===
-const CT_TO_EXT: Record<string, string> = {
-  'video/mp4': '.mp4',
-  'video/3gpp': '.3gp',
-  'video/quicktime': '.mov',
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/gif': '.gif',
-  'audio/ogg': '.ogg',
-  'audio/opus': '.opus',
-  'audio/mpeg': '.mp3',
-  'application/pdf': '.pdf',
-};
-
-function ensureFilenameWithExt(
-  name?: string,
-  contentType?: string,
-  fallback: string = 'file'
-): string {
-  let base = (name && name.trim()) || fallback;
-  const hasExt = /\.[a-z0-9]{2,5}$/i.test(base);
-  if (!hasExt) {
-    const ct = (contentType || '').toLowerCase();
-    const ext = CT_TO_EXT[ct] || '';
-    if (ext && !base.toLowerCase().endsWith(ext)) {
-      base += ext;
-    }
-  }
-  return base;
-}
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
   res.status(201).json({
@@ -903,7 +874,7 @@ export async function deleteMessage(req: Request, res: Response) {
 }
 export async function reactMessage(req: Request, res: Response) {
   /**
-     #swagger.tags = ["Messages"]
+   * #swagger.tags = ["Messages"]
      #swagger.autoBody=false
      #swagger.security = [{
             "bearerAuth": []
@@ -2251,8 +2222,6 @@ export async function getVotes(req: Request, res: Response) {
   }
 }
 
-/* ----------------- Helpers para download/retentativa/dedupe ----------------- */
-
 async function downloadToTemp(opts: {
   url: string;
   filename?: string;
@@ -2294,244 +2263,172 @@ async function downloadToTemp(opts: {
   };
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-function isTransientPptrError(err: any): boolean {
-  const msg = String(err?.message || err || '');
-  return /detached Frame|Execution context was destroyed|Cannot find context|Target closed|Navigation failed|ProtocolError/i.test(msg);
+// Dedupe de eventos Chatwoot (em memória)
+const CW_DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutos
+const cwProcessedIds: Map<string, number> = new Map();
+
+function cwSeen(id: string): boolean {
+  const t = cwProcessedIds.get(id);
+  return !!t && (Date.now() - t) < CW_DEDUPE_TTL_MS;
 }
-async function withRetry<T>(fn: () => Promise<T>, attempts = 2, delayMs = 1500): Promise<T> {
-  let lastErr: any;
-  for (let i = 0; i < attempts; i++) {
-    try { return await fn(); } catch (e) {
-      lastErr = e;
-      if (!isTransientPptrError(e) || i === attempts - 1) throw e;
-      await sleep(delayMs);
-    }
+function cwRemember(id: string) {
+  cwProcessedIds.set(id, Date.now());
+  // limpeza oportunista
+  const now = Date.now();
+  for (const [k, v] of cwProcessedIds) {
+    if ((now - v) > CW_DEDUPE_TTL_MS) cwProcessedIds.delete(k);
   }
-  throw lastErr;
-}
-const DEDUP_TTL_MS = 10 * 60_000; // 10 min
-const processedIds = new Map<string, NodeJS.Timeout>();
-function wasProcessed(id?: string | number | null): boolean {
-  if (!id) return false;
-  return processedIds.has(String(id));
-}
-function markProcessed(id?: string | number | null) {
-  if (!id) return;
-  const key = String(id);
-  if (processedIds.has(key)) return;
-  const t = setTimeout(() => processedIds.delete(key), DEDUP_TTL_MS);
-  processedIds.set(key, t);
 }
 
-/* -------------------------------- chatWoot ---------------------------------- */
 export async function chatWoot(req: Request, res: Response): Promise<any> {
   /**
      #swagger.tags = ["Misc"]
-     #swagger.description = 'You can point your Chatwoot to this route so that it can perform functions.'
+     #swagger.description = 'Webhook para eventos do Chatwoot.'
      #swagger.autoBody=false
      #swagger.security = [{ "bearerAuth": [] }]
      #swagger.parameters["session"] = { schema: 'NERDWHATS_AMERICA' }
-     #swagger.requestBody = {
-      required: true,
-      "@content": {
-        "application/json": {
-          schema: { type: "object", properties: { event: { type: "string" }, private: { type: "string" } } },
-          examples: { "Default": { value: { messageId: "conversation_status_changed", private: "false" } } }
-        }
-      }
-     }
-   */
-  const { session } = req.params as any;
+  */
+  const { session } = req.params;
   const client: any = clientsArray[session];
   if (!client || client.status !== 'CONNECTED') {
-    // responde rápido para não causar retry no Chatwoot
-    return res.status(200).json({ status: 'ignored', message: 'client not connected' });
+    return res.status(200).json({ status: 'ignored', reason: 'client-not-connected' });
   }
 
-  // --- helpers locais (para este handler) ---
-  const withRetry = async <T>(fn: () => Promise<T>, attempts = 2, delayMs = 2000): Promise<T> => {
-    let lastErr: any;
-    for (let i = 0; i < attempts; i++) {
-      try {
-        return await fn();
-      } catch (e: any) {
-        lastErr = e;
-        await new Promise(r => setTimeout(r, delayMs * (i + 1)));
-      }
-    }
-    throw lastErr;
-  };
+  // Extrai campos principais do payload
+  const event: string | undefined = req.body?.event;
+  const message_type: string | undefined = req.body?.message_type;
+  const phone =
+    req.body?.conversation?.meta?.sender?.phone_number?.replace('+', '') ||
+    req.body?.phone;
 
-  const adjustPageTimeouts = () => {
+  // O Chatwoot costuma mandar o item novo em req.body.message
+  const msg = req.body?.message || req.body?.conversation?.messages?.[0] || {};
+
+  // 1) Filtro: só processa se for exatamente o que queremos
+  if (event !== 'message_created' || message_type !== 'outgoing') {
+    return res.status(200).json({ status: 'ignored', reason: 'event-or-type-mismatch' });
+  }
+
+  // 2) Dedupe pelo ID da mensagem (se houver)
+  const cwMsgId: string =
+    String(msg?.id ?? req.body?.id ?? req.body?.message_id ?? '') || '';
+  if (cwMsgId && cwSeen(cwMsgId)) {
+    return res.status(200).json({ status: 'duplicate', message_id: cwMsgId });
+  }
+  if (cwMsgId) cwRemember(cwMsgId);
+
+  // 3) ACK imediato para evitar timeout/retry no Chatwoot
+  res.status(200).json({ status: 'queued', message_id: cwMsgId || null });
+
+  // ---- A partir daqui: processamento em background (não bloqueia o webhook) ----
+  setImmediate(async () => {
     try {
-      if (client?.page?.setDefaultTimeout) client.page.setDefaultTimeout(300000); // 5 min
-      if (client?.page?.setDefaultNavigationTimeout) client.page.setDefaultNavigationTimeout(300000);
-      // tenta ajustar o protocolo CDP (nem sempre disponível)
-      const cdp = (client?.page as any)?._client?.();
-      const conn = cdp?.connection?.();
-      if (typeof conn?.setProtocolTimeout === 'function') conn.setProtocolTimeout(300000);
-      req.logger?.info?.('[chatwoot] timeouts ajustados', { protocolTimeout: 300000 });
-    } catch (e: any) {
-      req.logger?.warn?.('[chatwoot] falha ao ajustar timeouts', { err: String(e?.message ?? e) });
-    }
-  };
-
-  const baseURL = String(client?.config?.chatWoot?.baseURL || '').replace(/\/+$/, '');
-  const cwToken =
-    client?.config?.chatWoot?.token ||
-    client?.config?.chatWoot?.accessToken ||
-    null;
-  const cwAuthHeaderName =
-    client?.config?.chatWoot?.authHeaderName || 'Authorization';
-
-  const resolveAttachmentUrl = (att: any): string | null => {
-    const downloadUrl = att?.download_url || att?.downloadUrl || att?.url;
-    if (typeof downloadUrl === 'string' && /^https?:\/\//i.test(downloadUrl)) return downloadUrl;
-    const du = att?.data_url;
-    if (typeof du !== 'string') return null;
-    if (/^https?:\/\//i.test(du)) return du;   // url absoluta
-    if (du.startsWith('/')) return `${baseURL}${du}`; // path absoluto
-    const railsIdx = du.indexOf('/rails/');
-    if (railsIdx >= 0) return `${baseURL}${du.substring(railsIdx)}`;
-    if (du.startsWith('data:')) return null;   // base64 -> não usar
-    return `${baseURL}/${du.replace(/^\/+/, '')}`; // path relativo
-  };
-  // --- fim helpers ---
-
-  try {
-    if (!(await client.isConnected())) {
-      return res.status(200).json({ status: 'ignored', message: 'client not connected (isConnected=false)' });
-    }
-
-    // Ajusta timeouts da página/CDP para evitar ProtocolError em uploads grandes
-    adjustPageTimeouts();
-
-    const event = (req.body as any).event;
-    const is_private = (req.body as any).private || (req.body as any).is_private;
-
-    if (
-      event === 'conversation_status_changed' ||
-      event === 'conversation_resolved' ||
-      is_private
-    ) {
-      return res.status(200).json({ status: 'success', message: 'Success on receive chatwoot' });
-    }
-
-    const {
-      message_type,
-      phone = req.body?.conversation?.meta?.sender?.phone_number?.replace('+', ''),
-      message = req.body?.conversation?.messages?.[0],
-    } = req.body || {};
-
-    // Só processa mensagens de saída criadas
-    if (event !== 'message_created' || message_type !== 'outgoing') {
-      return res.status(200).json({ status: 'success', message: 'Success on receive chatwoot' });
-    }
-
-    // ===== assinatura do agente =====
-    const agentName =
-      req.body?.message?.sender?.name ||
-      message?.sender?.name ||
-      req.body?.user?.name ||
-      req.body?.sender?.name ||
-      null;
-
-    const signDelimiter = '\n';
-    const makeSigned = (text?: string) => {
-      if (!agentName) return text ?? '';
-      const prefix = `*${agentName}:*`;
-      return (text && text.length > 0) ? `${prefix}${signDelimiter}${text}` : `${prefix}`;
-    };
-    // ================================
-
-    // **Importante**: responder já para o Chatwoot e só depois enviar ao WhatsApp
-    if (!res.headersSent) {
-      res.status(200).json({ status: 'accepted', message: 'processing async' });
-    }
-
-    // Processa em background imediato (mesma request loop, sem bloquear)
-    setImmediate(async () => {
-      try {
-        for (const contato of contactToArray(phone, false)) {
-          const atts = Array.isArray(message?.attachments) ? message.attachments : [];
-          const hasCaption = message?.content && message.content.trim().length > 0;
-          const signedCaption = hasCaption ? makeSigned(message.content) : (message?.content || '');
-
-          if (atts.length > 0) {
-            const att = atts[0]; // manter o primeiro anexo (comportamento atual)
-            const fileUrl = resolveAttachmentUrl(att);
-
-            if (!fileUrl) {
-              await client.sendText(contato, makeSigned('Não foi possível resolver a URL do anexo.'));
-              continue;
-            }
-
-            // Só manda header de auth se o arquivo for do mesmo host do Chatwoot
-            const sendAuth = baseURL && fileUrl.startsWith(baseURL) && cwToken;
-            const headers: Record<string, string> | undefined = sendAuth
-              ? {
-                  [cwAuthHeaderName]:
-                    cwAuthHeaderName.toLowerCase() === 'authorization'
-                      ? `Bearer ${cwToken}`
-                      : String(cwToken),
-                }
-              : undefined;
-
-            // Baixa para arquivo temporário
-            const { filePath, filename, contentType, cleanup } = await downloadToTemp({
-              url: fileUrl,
-              filename: att?.filename,
-              headers,
-            });
-
-            // (opcional - filename) garante extensão coerente, se você tiver ensureFilenameWithExt()
-            const safeName = typeof ensureFilenameWithExt === 'function'
-              ? ensureFilenameWithExt(filename || att?.filename, contentType, att?.filename || 'file')
-              : (att?.filename || filename || 'file');
-
-            req.logger?.info?.('[chatwoot] enviando anexo via WhatsApp', {
-              contato,
-              fileUrl,
-              filenameOriginal: att?.filename,
-              filenameUsado: safeName,
-              contentType,
-              fileType: att?.file_type,
-            });
-
-            try {
-              if (att?.file_type === 'audio') {
-                await withRetry(() =>
-                  client.sendPtt(`${contato}`, filePath, safeName || 'Voice Audio', signedCaption)
-                );
-              } else {
-                await withRetry(() =>
-                  client.sendFile(`${contato}`, filePath, safeName || 'file', signedCaption)
-                );
-              }
-            } finally {
-              cleanup();
-            }
-          } else {
-            // Texto puro
-            const signedText = makeSigned(message?.content || '');
-            await withRetry(() => client.sendText(contato, signedText));
-          }
-        }
-      } catch (err: any) {
-        try { req.logger?.error?.(err); } catch {}
-        console.error('chatWoot async send error:', err);
+      if (!(await client.isConnected())) {
+        req.logger?.warn?.('chatWoot: client lost connection before send');
+        return;
       }
-    });
-  } catch (e: any) {
-    try { req.logger?.error?.(e); } catch {}
-    if (!res.headersSent) {
-      return res
-        .status(200)
-        .json({ status: 'accepted_with_error', error: String((e as any)?.message ?? e) });
+      if (!phone) {
+        req.logger?.warn?.('chatWoot: missing phone in payload');
+        return;
+      }
+
+      // Assinatura (nome do atendente)
+      const agentName =
+        req.body?.message?.sender?.name ||
+        msg?.sender?.name ||
+        req.body?.user?.name ||
+        req.body?.sender?.name ||
+        null;
+
+      const makeSigned = (text?: string) => {
+        if (!agentName) return text ?? '';
+        const prefix = `*${agentName}:*`;
+        const t = (text || '').trim();
+        return t ? `${prefix}\n${t}` : prefix;
+      };
+
+      // Resolve URL do anexo (nunca base64)
+      const baseURL = (client?.config?.chatWoot?.baseURL || '').replace(/\/+$/, '');
+      const resolveAttachmentUrl = (att: any): string | null => {
+        const direct = att?.download_url || att?.downloadUrl || att?.url;
+        if (typeof direct === 'string' && /^https?:\/\//i.test(direct)) return direct;
+        const du = att?.data_url;
+        if (typeof du !== 'string') return null;
+        if (/^https?:\/\//i.test(du)) return du;
+        if (du.startsWith('/')) return `${baseURL}${du}`;
+        const railsIdx = du.indexOf('/rails/');
+        if (railsIdx >= 0) return `${baseURL}${du.substring(railsIdx)}`;
+        if (du.startsWith('data:')) return null; // ignorar base64
+        return `${baseURL}/${du.replace(/^\/+/, '')}`;
+      };
+
+      // Headers para baixar do Chatwoot quando necessário
+      const cwToken =
+        client?.config?.chatWoot?.token ||
+        client?.config?.chatWoot?.accessToken ||
+        null;
+      const cwAuthHeaderName =
+        client?.config?.chatWoot?.authHeaderName || 'Authorization';
+
+      const maybeAuthHeaders = (url: string): Record<string, string> | undefined => {
+        if (!cwToken || !baseURL) return undefined;
+        if (!url.startsWith(baseURL)) return undefined;
+        return cwAuthHeaderName.toLowerCase() === 'authorization'
+          ? { Authorization: `Bearer ${cwToken}` }
+          : { [cwAuthHeaderName]: String(cwToken) };
+      };
+
+      // Prepara destinos (suporta string/array)
+      const destinos = contactToArray(phone, false);
+
+      // Decide: anexo ou texto
+      const atts = Array.isArray(msg?.attachments) ? msg.attachments : [];
+      if (atts.length > 0) {
+        // Importante: muitos canais do Chatwoot criam uma "mensagem" do tipo texto
+        // e depois uma separada para o anexo. Como deduplicamos por msg.id e só
+        // entramos no fluxo 'outgoing + message_created', evitamos mandar duas vezes.
+        const att = atts[0]; // mantém sua política atual (1º anexo)
+        const url = resolveAttachmentUrl(att);
+        const caption = makeSigned(msg?.content || '');
+
+        if (!url) {
+          for (const contato of destinos) {
+            await client.sendText(contato, makeSigned('Não foi possível baixar o anexo.'));
+          }
+          return;
+        }
+
+        // Baixa para arquivo temporário e envia por PATH local
+        const { filePath, filename, cleanup } = await downloadToTemp({
+          url,
+          filename: att?.filename,
+          headers: maybeAuthHeaders(url),
+        });
+
+        try {
+          for (const contato of destinos) {
+            if (att?.file_type === 'audio') {
+              await client.sendPtt(`${contato}`, filePath, filename || 'Voice Audio', caption);
+            } else {
+              await client.sendFile(`${contato}`, filePath, filename || 'file', caption);
+            }
+          }
+        } finally {
+          cleanup();
+        }
+      } else {
+        // Texto puro
+        const text = makeSigned(msg?.content || '');
+        for (const contato of destinos) {
+          await client.sendText(contato, text);
+        }
+      }
+    } catch (err) {
+      req.logger?.error?.('chatWoot async send error:', err);
     }
-  }
+  });
 }
+
 
 
 
