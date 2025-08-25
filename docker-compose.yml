@@ -10,6 +10,7 @@ services:
     volumes:
       - ./config.ts:/usr/src/wpp-server/config.ts
       - ./wppconnect_tokens:/usr/src/wpp-server/tokens
+      - ./WhatsAppImages:/usr/src/wpp-server/WhatsAppImages      
     ports:
       - "21465:21465"
 
