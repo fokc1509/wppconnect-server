@@ -2265,7 +2265,6 @@ async function downloadToTemp(opts: {
 }
 
 // ===================== HELPERS (Topo do arquivo) =====================
-import { spawn } from 'child_process'; // <— adicione este import
 
 // Dedupe de eventos Chatwoot (em memória)
 const CW_DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutos
@@ -2343,7 +2342,7 @@ async function transcodeToMp4(inputPath: string): Promise<string> {
   return outPath;
 }
 // =================== FIM HELPERS (Topo do arquivo) ===================
-
+// ===================== FUNCAO CHATWOOT =====================
 export async function chatWoot(req: Request, res: Response): Promise<any> {
   /**
      #swagger.tags = ["Misc"]
@@ -2528,10 +2527,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
   });
 }
 
-
-
-
-
+// ===================== FIM FUNCAO CHATWOOT =====================
 
 export async function getPlatformFromMessage(req: Request, res: Response) {
   /**
