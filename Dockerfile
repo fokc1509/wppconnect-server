@@ -1,74 +1,35 @@
-# =========================
-# 1) BUILD (TS -> JS)
-# =========================
-FROM node:22.18.0-alpine AS build
+FROM node:22.18.0-alpine AS base
 WORKDIR /usr/src/wpp-server
-
-ENV HUSKY=0
-
-# Toolchain p/ módulos nativos (se necessário)
-RUN apk add --no-cache python3 make g++ pkgconfig
-
-# Copia só package.json (não usa yarn.lock)
+ENV NODE_ENV=production PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 COPY package.json ./
+RUN apk update && \
+    apk add --no-cache \
+    vips-dev \
+    fftw-dev \
+    gcc \
+    g++ \
+    make \
+    libc6-compat \
+    && rm -rf /var/cache/apk/*
+RUN yarn install --production --pure-lockfile && \
+    yarn add sharp --ignore-engines && \
+    yarn cache clean
 
-# Usa o yarn que já vem na imagem
-RUN yarn install --production=false
-
-# Copia o restante do código
+FROM base AS build
+WORKDIR /usr/src/wpp-server
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+COPY package.json ./
+RUN yarn install --production=false --pure-lockfile
+RUN yarn cache clean
 COPY . .
-
-# Compila TypeScript p/ dist/
 RUN yarn build
 
-
-# =========================
-# 2) RUNTIME
-# =========================
-FROM node:22.18.0-alpine AS runtime
-WORKDIR /usr/src/wpp-server
-
-# Chromium + ffmpeg + libs necessárias (nomes compatíveis com Alpine 3.22)
-RUN apk add --no-cache \
-    chromium \
-    ffmpeg \
-    nss \
-    freetype \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont \
-    ttf-dejavu \
-    libx11 \
-    libxcomposite \
-    libxdamage \
-    libxrandr \
-    libxfixes \
-    libxcb \
-    gdk-pixbuf \
-    pango \
-    gtk+3.0 \
-    alsa-lib \
-    at-spi2-core
-
-# Se o binário estiver como chromium-browser, cria symlink
-RUN if [ -x /usr/bin/chromium-browser ]; then ln -sf /usr/bin/chromium-browser /usr/bin/chromium; fi
-
-# Puppeteer-core usará o Chromium do sistema
-ENV PUPPETEER_SKIP_DOWNLOAD=1
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-
-# Ambiente
-ENV NODE_ENV=production
-ENV TZ=America/Sao_Paulo
-ENV NODE_OPTIONS=--max-old-space-size=1024
-ENV HUSKY=0
-
-# Copia artefatos do build
-COPY --from=build /usr/src/wpp-server/dist ./dist
-COPY --from=build /usr/src/wpp-server/package.json ./
-
-# Instala SOMENTE deps de produção (usando o yarn já presente)
-RUN yarn install --production
-
+FROM base
+WORKDIR /usr/src/wpp-server/
+# ⬇️ aqui a ÚNICA alteração: incluir ffmpeg junto com o chromium
+RUN apk add --no-cache chromium ffmpeg
+RUN yarn cache clean
+COPY . .
+COPY --from=build /usr/src/wpp-server/ /usr/src/wpp-server/
 EXPOSE 21465
-CMD ["node", "dist/index.js"]
+ENTRYPOINT ["node", "dist/server.js"]
