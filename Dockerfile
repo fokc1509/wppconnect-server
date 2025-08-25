@@ -5,13 +5,20 @@ FROM node:22.18.0-alpine AS build
 WORKDIR /usr/src/wpp-server
 
 ENV HUSKY=0
-RUN apk add --no-cache python3 make g++ pkgconfig
-RUN npm i -g yarn@1.22.22
 
+# Toolchain p/ módulos nativos (se necessário)
+RUN apk add --no-cache python3 make g++ pkgconfig
+
+# Copia só package.json (não usa yarn.lock)
 COPY package.json ./
+
+# Usa o yarn que já vem na imagem
 RUN yarn install --production=false
 
+# Copia o restante do código
 COPY . .
+
+# Compila TypeScript p/ dist/
 RUN yarn build
 
 
@@ -21,7 +28,7 @@ RUN yarn build
 FROM node:22.18.0-alpine AS runtime
 WORKDIR /usr/src/wpp-server
 
-# Chromium + ffmpeg + libs (compatíveis com Alpine 3.22)
+# Chromium + ffmpeg + libs necessárias (nomes compatíveis com Alpine 3.22)
 RUN apk add --no-cache \
     chromium \
     ffmpeg \
@@ -43,24 +50,24 @@ RUN apk add --no-cache \
     alsa-lib \
     at-spi2-core
 
-# Em algumas builds o binário é chromium-browser; cria symlink para /usr/bin/chromium
+# Se o binário estiver como chromium-browser, cria symlink
 RUN if [ -x /usr/bin/chromium-browser ]; then ln -sf /usr/bin/chromium-browser /usr/bin/chromium; fi
 
 # Puppeteer-core usará o Chromium do sistema
 ENV PUPPETEER_SKIP_DOWNLOAD=1
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
+# Ambiente
 ENV NODE_ENV=production
 ENV TZ=America/Sao_Paulo
 ENV NODE_OPTIONS=--max-old-space-size=1024
 ENV HUSKY=0
 
-RUN npm i -g yarn@1.22.22
-
+# Copia artefatos do build
 COPY --from=build /usr/src/wpp-server/dist ./dist
 COPY --from=build /usr/src/wpp-server/package.json ./
 
-# Somente deps de produção; sem exigir yarn.lock
+# Instala SOMENTE deps de produção (usando o yarn já presente)
 RUN yarn install --production
 
 EXPOSE 21465
