@@ -78,7 +78,7 @@ export default {
       
     ],
     puppeteerOptions: {
-      protocolTimeout: 120000 // 2 minutos
+      protocolTimeout: 180000 // 2 minutos
     },
     /**
      * Example of configuring the linkPreview generator
