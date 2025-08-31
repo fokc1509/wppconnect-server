@@ -71,7 +71,7 @@ export default {
       '--ignore-ssl-errors',
       '--ignore-certificate-errors-spki-list',
       // >>> PROXY FIXO (Webshare) <<<
-      '--proxy-server=http://qtdyyirf-BR-1:040uiup906io@p.webshare.io:80',
+      '--proxy-server=http://qtdyyirf-BR-rotate:040uiup906io@p.webshare.io:80',
       // opcional: não passar tráfego local pelo proxy
       '--proxy-bypass-list=<-loopback,localhost,127.0.0.1,::1>',
       
