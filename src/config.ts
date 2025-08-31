@@ -71,10 +71,6 @@ export default {
       '--ignore-certificate-errors',
       '--ignore-ssl-errors',
       '--ignore-certificate-errors-spki-list',
-      // >>> PROXY FIXO (Webshare) <<<
-     // '--proxy-server=http://p.webshare.io:9999',
-      // opcional: não passar tráfego local pelo proxy
-    //  '--proxy-bypass-list=<-loopback,localhost,127.0.0.1,::1>',
       
     ],
     puppeteerOptions: {
