@@ -2373,7 +2373,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
   }
 
   // --------------------- Filtro @arqos (controlado por config.chatWoot.bot_tag) ---------------------
-  const botTagEnabled: boolean = !!(client?.config?.chatWoot?.bot_tag);
+  const botTagEnabled: boolean = !!(client?.config?.chatwoot?.bot_tag);
   if (botTagEnabled) {
     // pega texto/caption e normaliza (remove HTML, quebra <br>, trim)
     const rawText: string =
