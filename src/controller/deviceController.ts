@@ -2372,6 +2372,32 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
     return res.status(200).json({ status: 'ignored', reason: 'event-or-type-mismatch' });
   }
 
+  // --------------------- Filtro @arqos (controlado por config.chatWoot.bot_tag) ---------------------
+  const botTagEnabled: boolean = !!(client?.config?.chatWoot?.bot_tag);
+  if (botTagEnabled) {
+    // pega texto/caption e normaliza (remove HTML, quebra <br>, trim)
+    const rawText: string =
+      (typeof msg?.content === 'string' && msg.content) ||
+      (typeof req.body?.content === 'string' && req.body.content) ||
+      '';
+
+    const normalizedText = rawText
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .trim();
+
+    // ignora apenas se COMEÇAR com @arqos (case-insensitive)
+    if (/^\s*@arqos\b/i.test(normalizedText)) {
+      try { req.logger?.info?.(`chatwoot: mensagem ignorada por prefixo @arqos (sessão ${session})`); } catch {}
+      return res.status(200).json({
+        status: 'ignored',
+        reason: 'bot_tag-prefix',
+        prefix: '@arqos'
+      });
+    }
+  }
+  // --------------------------------------------------------------------------------------------------
+
   // Dedupe por message.id (evita reentregas/duplicidades)
   const cwMsgId: string = String(msg?.id ?? req.body?.id ?? req.body?.message_id ?? '') || '';
   if (cwMsgId && cwSeen(cwMsgId)) {
@@ -2492,7 +2518,6 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
                   await withRetry(() => client.sendFile(`${contato}`, pathToSend, nameToSend, caption));
                 }
               } finally {
-                // apaga o transcode
                 try { unlinkSync(mp4Path); } catch {}
               }
               return;
