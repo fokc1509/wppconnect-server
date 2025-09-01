@@ -21,10 +21,12 @@ import { clientsArray } from '../util/sessionUtil';
 
 
 import axios from 'axios';
-import { createWriteStream, createReadStream, unlinkSync} from 'fs';
+import { createWriteStream, createReadStream, unlinkSync, mkdtempSync} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { spawn } from 'child_process'; 
+import { pipeline } from 'node:stream/promises';
+import { randomUUID } from 'crypto';
 import * as os from 'os';
 import * as path from 'path';
 import { promises as fsp } from 'node:fs';
@@ -2225,92 +2227,83 @@ export async function getVotes(req: Request, res: Response) {
 }
 // FUNCOES CHATWOOT
 // === HELPERS MÍNIMOS PARA CHATWOOT ===
+// ================= helpers exigidos pela chatWoot =================
 
-// Ajuste de timeouts da Page/CDP (Puppeteer)
-export function adjustPageTimeouts(client: any, logger?: any) {
-  try {
-    if (client?.page?.setDefaultTimeout) client.page.setDefaultTimeout(300000); // 5 min
-    if (client?.page?.setDefaultNavigationTimeout) client.page.setDefaultNavigationTimeout(300000);
-    const cdp = (client?.page as any)?._client?.();
-    const conn = cdp?.connection?.();
-    if (typeof conn?.setProtocolTimeout === 'function') conn.setProtocolTimeout(300000);
-    logger?.info?.('[chatwoot] timeouts ajustados', { protocolTimeout: 300000 });
-  } catch (e: any) {
-    logger?.warn?.('[chatwoot] falha ao ajustar timeouts', { err: String(e?.message ?? e) });
-  }
+// Baixa uma URL (seguindo redirects) para um arquivo temporário
+export async function downloadToTemp(opts: {
+  url: string;
+  filename?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+}) {
+  const { url, filename, headers, timeoutMs = 180_000 } = opts;
+
+  const response = await axios.get(url, {
+    responseType: 'stream',
+    timeout: timeoutMs,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+    headers,
+    validateStatus: s => s >= 200 && s < 400, // aceita 3xx para redirect chain
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
+  const name =
+    filename ||
+    (url.split('?')[0].split('/').pop() || `file-${randomUUID()}`);
+  const filePath = join(dir, name);
+
+  await pipeline(response.data, createWriteStream(filePath));
+  const contentType =
+    (response.headers && (response.headers['content-type'] as string)) || '';
+
+  return {
+    filePath,
+    filename: name,
+    contentType,
+    cleanup: () => {
+      try { unlinkSync(filePath); } catch {}
+    },
+  };
 }
 
-// Detecta se o anexo é vídeo (usado apenas para escolher o fluxo de envio)
-export function isVideoAttachment(att: any, contentType?: string, name?: string): boolean {
+// Concatena stream de arquivo em base64 (tolerante a string|Buffer)
+export async function fileToBase64(filePath: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const rs = createReadStream(filePath); // NÃO definir .setEncoding()
+
+    rs.on('data', (chunk: unknown) => {
+      if (Buffer.isBuffer(chunk)) {
+        chunks.push(chunk);
+      } else {
+        // se vier string por algum motivo, converte
+        chunks.push(Buffer.from(String(chunk)));
+      }
+    });
+    rs.once('error', reject);
+    rs.once('end', () => {
+      try {
+        resolve(Buffer.concat(chunks).toString('base64'));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+// Heurística simples: é vídeo?
+function isVideoAttachment(att: any, contentType?: string, name?: string) {
   const t = String(att?.file_type || '').toLowerCase();
   const ct = String(contentType || '').toLowerCase();
   const n = String(name || att?.filename || '').toLowerCase();
   if (t === 'video') return true;
   if (ct.startsWith('video/')) return true;
-  return /\.(mp4|m4v|mov|3gp|webm|mkv|avi)$/i.test(n);
+  if (/\.(mp4|m4v|mov|3gp|webm|mkv|avi)$/i.test(n)) return true;
+  return false;
 }
 
-// Transcodifica para MP4 (H.264/AAC) com flags compatíveis com WhatsApp Web
-export async function transcodeToMp4(inputPath: string): Promise<string> {
-  const outPath = inputPath.toLowerCase().endsWith('.mp4') ? inputPath : `${inputPath}.mp4`;
-  await new Promise<void>((resolve, reject) => {
-    const args = [
-      '-y', '-i', inputPath,
-      // vídeo: limita largura a 1280, garante dimensões pares, H.264 yuv420p, faststart
-      '-vf', "scale='min(1280,iw)':'-2',pad=ceil(iw/2)*2:ceil(ih/2)*2",
-      '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main', '-level', '3.1',
-      '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-crf', '23',
-      // áudio: AAC 48 kHz
-      '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
-      outPath,
-    ];
-    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'inherit'] });
-    proc.on('error', reject);
-    proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`))));
-  });
-  return outPath;
-}
-
-// Concatena arquivo em base64 (para fallback via Data URL)
-export async function fileToBase64(filePath: string): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    const rs = createReadStream(filePath); // NÃO setar .setEncoding()
-    rs.on('data', (chunk: unknown) => {
-      if (Buffer.isBuffer(chunk)) chunks.push(chunk);
-      else chunks.push(Buffer.from(String(chunk)));
-    });
-    rs.once('error', reject);
-    rs.once('end', () => {
-      try { resolve(Buffer.concat(chunks).toString('base64')); }
-      catch (e) { reject(e); }
-    });
-  });
-}
-
-// (Opcional) utilitário para apagar arquivo sem quebrar fluxo
-export async function safeUnlink(p: string) {
-  try { await fsp.unlink(p); } catch {}
-}
-
-
-// ----- DEDUPE (10 min) ----- Corrigir erro de timeout no chatwoot
-const CW_DEDUPE_TTL_MS = 10 * 60 * 1000;
-const cwProcessedIds: Map<string, number> = new Map();
-
-function cwSeen(id: string): boolean {
-  const t = cwProcessedIds.get(id);
-  return !!t && (Date.now() - t) < CW_DEDUPE_TTL_MS;
-}
-function cwRemember(id: string) {
-  cwProcessedIds.set(id, Date.now());
-  // limpeza oportunista
-  const now = Date.now();
-  for (const [k, v] of cwProcessedIds) {
-    if (now - v > CW_DEDUPE_TTL_MS) cwProcessedIds.delete(k);
-  }
-}
-/** Tenta detectar se já é um MP4 “bom” para envio direto */
+// É MP4 "provável" para envio direto?
 function isProbablyMp4Video(filename?: string, contentType?: string): boolean {
   const ct = (contentType || '').toLowerCase();
   const hasMp4Ct = ct === 'video/mp4' || ct.startsWith('video/mp4;');
@@ -2318,7 +2311,28 @@ function isProbablyMp4Video(filename?: string, contentType?: string): boolean {
   return hasMp4Ct || hasMp4Ext;
 }
 
-/** Retry simples com backoff linear */
+// Transcodifica para MP4 (H.264/AAC) com flags compatíveis com WA
+async function transcodeToMp4(inputPath: string): Promise<string> {
+  const outPath = inputPath.endsWith('.mp4') ? inputPath : `${inputPath}.mp4`;
+  await new Promise<void>((resolve, reject) => {
+    const args = [
+      '-y', '-i', inputPath,
+      // vídeo: 1280 máx de largura, dimensões pares, H.264 yuv420p, faststart
+      '-vf', "scale='min(1280,iw)':'-2',pad=ceil(iw/2)*2:ceil(ih/2)*2",
+      '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main', '-level', '3.1',
+      '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-crf', '23',
+      // áudio: AAC, 48 kHz
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
+      outPath
+    ];
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'inherit'] });
+    proc.on('error', reject);
+    proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`)));
+  });
+  return outPath;
+}
+
+// Retry simples com backoff linear
 async function withRetry<T>(
   fn: () => Promise<T>,
   attempts = 2,
@@ -2336,7 +2350,7 @@ async function withRetry<T>(
   throw lastErr;
 }
 
-/** Enxuga o retorno do WPP para logar sem poluir */
+// Enxuga o retorno do WPP para logar sem poluir
 function summarizeSend(ret: any) {
   if (!ret) return ret;
   const { id, ack, to, mimetype, type } = ret as any;
