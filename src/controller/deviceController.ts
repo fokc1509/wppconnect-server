@@ -2521,14 +2521,6 @@ async function sendVideoAsBase64(opts: {
   await withRetry(() => client.sendFile(`${contato}`, dataUrl, filename, caption));
 }
 
-function summarizeSend(ret: any) {
-  if (!ret) return ret;
-  const { id, ack, to, mimetype, type } = ret as any;
-  return { id, ack, to, mimetype, type };
-}
-
-
-
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
 export async function chatWoot(req: Request, res: Response): Promise<any> {
@@ -2819,12 +2811,20 @@ for (const contato of destinos) {
 } finally {
   cleanup();
 }
-} else {
-  // Texto puro
-  for (const contato of destinos) {
-    await withRetry(() => client.sendText(contato, caption));
+  } else {
+    // Texto puro
+    for (const contato of destinos) {
+      await withRetry(() => client.sendText(contato, caption));
+    }
   }
+
+} catch (err: any) {
+  try { req.logger?.error?.('chatWoot async send error:', err); } catch {}
+  console.error('chatWoot async send error:', err);
 }
+}); // fecha setImmediate
+} // fecha chatWoot
+
 
 
 // ===================== FIM FUNCAO CHATWOOT =====================
