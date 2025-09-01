@@ -2310,7 +2310,38 @@ function cwRemember(id: string) {
     if (now - v > CW_DEDUPE_TTL_MS) cwProcessedIds.delete(k);
   }
 }
+/** Tenta detectar se já é um MP4 “bom” para envio direto */
+function isProbablyMp4Video(filename?: string, contentType?: string): boolean {
+  const ct = (contentType || '').toLowerCase();
+  const hasMp4Ct = ct === 'video/mp4' || ct.startsWith('video/mp4;');
+  const hasMp4Ext = !!(filename || '').toLowerCase().endsWith('.mp4');
+  return hasMp4Ct || hasMp4Ext;
+}
 
+/** Retry simples com backoff linear */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  attempts = 2,
+  delayMs = 2000
+): Promise<T> {
+  let lastErr: any;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/** Enxuga o retorno do WPP para logar sem poluir */
+function summarizeSend(ret: any) {
+  if (!ret) return ret;
+  const { id, ack, to, mimetype, type } = ret as any;
+  return { id, ack, to, mimetype, type };
+}
 
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
