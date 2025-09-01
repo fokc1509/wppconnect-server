@@ -27,10 +27,7 @@ import { join } from 'path';
 import { pipeline } from 'node:stream/promises';
 import { randomUUID } from 'crypto';
 import { spawn } from 'child_process'; // <— adicione este import
-import http from 'node:http';
-import https from 'node:https';
-import * as dns from 'node:dns';
-import * as net from 'node:net';
+
 
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
@@ -2228,143 +2225,77 @@ export async function getVotes(req: Request, res: Response) {
 }
 // FUNCOES CHATWOOT
 // ========== helper robusto para download (IPv4, keepalive, redirect-safe, proxy-aware) ==========
-// força IPv4, mas sem quebrar se chamarem sem hostname
-const lookup4: any = (hostname: any, _opts: any, cb: any) => {
+// === HELPERS MÍNIMOS PARA CHATWOOT ===
+
+import { spawn } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import { promises as fsp } from 'node:fs';
+
+// Ajuste de timeouts da Page/CDP (Puppeteer)
+export function adjustPageTimeouts(client: any, logger?: any) {
   try {
-    if (!hostname || typeof hostname !== 'string') {
-      // devolve erro “leve” para a stack superior tratar como falha de rede
-      return process.nextTick(() => cb(Object.assign(new Error('EINVAL_HOSTNAME'), { code: 'EINVAL_HOSTNAME' }), null, 4));
-    }
-    // se já vier um IP, devolve direto
-    if (net.isIP(hostname)) {
-      return process.nextTick(() => cb(null, hostname, 4));
-    }
-    (dns as any).lookup(hostname, { family: 4, all: false }, cb);
-  } catch (e) {
-    return cb(e, null, 4);
+    if (client?.page?.setDefaultTimeout) client.page.setDefaultTimeout(300000); // 5 min
+    if (client?.page?.setDefaultNavigationTimeout) client.page.setDefaultNavigationTimeout(300000);
+    const cdp = (client?.page as any)?._client?.();
+    const conn = cdp?.connection?.();
+    if (typeof conn?.setProtocolTimeout === 'function') conn.setProtocolTimeout(300000);
+    logger?.info?.('[chatwoot] timeouts ajustados', { protocolTimeout: 300000 });
+  } catch (e: any) {
+    logger?.warn?.('[chatwoot] falha ao ajustar timeouts', { err: String(e?.message ?? e) });
   }
-};
-
-
-const httpAgentKA = new http.Agent({ keepAlive: true, maxSockets: 12, scheduling: 'lifo' as any });
-const httpsAgentKA = new https.Agent({
-  keepAlive: true,
-  maxSockets: 12,
-  scheduling: 'lifo' as any,
-  rejectUnauthorized: true
-});
-
-function shouldBypassProxy(urlStr: string): boolean {
-  // honra NO_PROXY: lista separada por vírgula, suporta host:port e sufixos
-  const noProxy = (process.env.NO_PROXY || process.env.no_proxy || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (noProxy.length === 0) return false;
-  try {
-    const u = new URL(urlStr);
-    const host = u.hostname.toLowerCase();
-    const hostPort = u.port ? `${host}:${u.port}` : host;
-    return noProxy.some(rule => {
-      const r = rule.toLowerCase();
-      if (r === '*' ) return true;
-      if (host === r || hostPort === r) return true;
-      // sufixo .dominio
-      if (r.startsWith('.')) return host.endsWith(r);
-      // sem ponto: trata como sufixo também
-      return host.endsWith(r);
-    });
-  } catch { return false; }
 }
 
-async function axiosGetStream(url: string, timeoutMs: number, extraHeaders?: Record<string, string>) {
-  const useProxy = !shouldBypassProxy(url);
+// Detecta se o anexo é vídeo (usado apenas para escolher o fluxo de envio)
+export function isVideoAttachment(att: any, contentType?: string, name?: string): boolean {
+  const t = String(att?.file_type || '').toLowerCase();
+  const ct = String(contentType || '').toLowerCase();
+  const n = String(name || att?.filename || '').toLowerCase();
+  if (t === 'video') return true;
+  if (ct.startsWith('video/')) return true;
+  return /\.(mp4|m4v|mov|3gp|webm|mkv|avi)$/i.test(n);
+}
 
-  return axios({
-    method: 'GET',
-    url,
-    responseType: 'stream',
-    timeout: timeoutMs,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
+// Transcodifica para MP4 (H.264/AAC) com flags compatíveis com WhatsApp Web
+export async function transcodeToMp4(inputPath: string): Promise<string> {
+  const outPath = inputPath.toLowerCase().endsWith('.mp4') ? inputPath : `${inputPath}.mp4`;
+  await new Promise<void>((resolve, reject) => {
+    const args = [
+      '-y', '-i', inputPath,
+      // vídeo: limita largura a 1280, garante dimensões pares, H.264 yuv420p, faststart
+      '-vf', "scale='min(1280,iw)':'-2',pad=ceil(iw/2)*2:ceil(ih/2)*2",
+      '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main', '-level', '3.1',
+      '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-crf', '23',
+      // áudio: AAC 48 kHz
+      '-c:a', 'aac', '-b:a', '128k', '-ar', '48000',
+      outPath,
+    ];
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'inherit'] });
+    proc.on('error', reject);
+    proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`))));
+  });
+  return outPath;
+}
 
-    // preferir IPv4 sem depender do lookup custom se a lib não chamar
-    // (Node http/https aceita 'family' diretamente)
-    // @ts-ignore
-    family: 4,
-
-    httpAgent: httpAgentKA,
-    httpsAgent: httpsAgentKA,
-
-    maxRedirects: 5,
-
-    // siga usando o lookup4, mas ele já está resiliente
-    // @ts-ignore
-    lookup: lookup4,
-
-    // garantir que cada redirect herde o setup
-    // @ts-ignore
-    beforeRedirect: (options: any) => {
-      options.family = 4;
-      options.lookup = lookup4;
-      options.agents = { http: httpAgentKA, https: httpsAgentKA };
-      options.agent = options.protocol === 'http:' ? httpAgentKA : httpsAgentKA;
-    },
-
-    headers: {
-      'User-Agent': 'wppconnect-media-fetch/1.0',
-      'Accept': '*/*',
-      ...(extraHeaders || {}),
-    },
-
-    // se NO_PROXY casar, desliga proxy do axios
-    proxy: useProxy ? undefined : false,
-    decompress: true,
-    transitional: { clarifyTimeoutError: true },
-    validateStatus: (s) => s >= 200 && s < 400,
+// Concatena arquivo em base64 (para fallback via Data URL)
+export async function fileToBase64(filePath: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const rs = createReadStream(filePath); // NÃO setar .setEncoding()
+    rs.on('data', (chunk: unknown) => {
+      if (Buffer.isBuffer(chunk)) chunks.push(chunk);
+      else chunks.push(Buffer.from(String(chunk)));
+    });
+    rs.once('error', reject);
+    rs.once('end', () => {
+      try { resolve(Buffer.concat(chunks).toString('base64')); }
+      catch (e) { reject(e); }
+    });
   });
 }
 
-
-export async function downloadToTemp(opts: {
-  url: string;
-  filename?: string;
-  headers?: Record<string, string>;
-  timeoutMs?: number;
-}) {
-  const { url, filename, headers, timeoutMs = 180_000 } = opts;
-
-  // retry leve (3 tentativas)
-  const attempts = 3;
-  let lastErr: any;
-  let resp: any;
-
-  for (let i = 0; i < attempts; i++) {
-    try {
-      resp = await axiosGetStream(url, timeoutMs, headers);
-      break;
-    } catch (err: any) {
-      lastErr = err;
-      // erros de rede transitórios → pequeno backoff e tenta de novo
-      const code = err?.code || err?.cause?.code;
-      if (['ETIMEDOUT', 'ECONNRESET', 'ENETUNREACH', 'EAI_AGAIN', 'EHOSTUNREACH'].includes(code)) {
-        await new Promise(r => setTimeout(r, 500 * (i + 1)));
-        continue;
-      }
-      throw err;
-    }
-  }
-  if (!resp) throw lastErr || new Error('download failed without response');
-
-  const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
-  const name = filename || (url.split('?')[0].split('/').pop() || `file-${randomUUID()}`);
-  const filePath = join(dir, name);
-  await pipeline(resp.data, createWriteStream(filePath));
-  const contentType = resp.headers?.['content-type'] || '';
-
-  return {
-    filePath,
-    filename: name,
-    contentType,
-    cleanup: () => { try { unlinkSync(filePath); } catch {} },
-  };
+// (Opcional) utilitário para apagar arquivo sem quebrar fluxo
+export async function safeUnlink(p: string) {
+  try { await fsp.unlink(p); } catch {}
 }
 
 // Dedupe de eventos Chatwoot (em memória)
@@ -2384,418 +2315,192 @@ function cwRemember(id: string) {
   }
 }
 
-// Ajuste de timeouts da Page/CDP (Puppeteer)
-function adjustPageTimeouts(client: any, logger?: any) {
-  try {
-    if (client?.page?.setDefaultTimeout) client.page.setDefaultTimeout(300000);              // 5 min
-    if (client?.page?.setDefaultNavigationTimeout) client.page.setDefaultNavigationTimeout(300000);
-    const cdp = (client?.page as any)?._client?.();
-    const conn = cdp?.connection?.();
-    if (typeof conn?.setProtocolTimeout === 'function') conn.setProtocolTimeout(300000);
-    logger?.info?.('[chatwoot] timeouts ajustados', { protocolTimeout: 300000 });
-  } catch (e: any) {
-    logger?.warn?.('[chatwoot] falha ao ajustar timeouts', { err: String(e?.message ?? e) });
-  }
-}
 
-// Retry simples com backoff
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  attempts = 2,
-  delayMs = 2000
-): Promise<T> {
-  let lastErr: any;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (e: any) {
-      lastErr = e;
-      await new Promise(r => setTimeout(r, delayMs * (i + 1)));
-    }
-  }
-  throw lastErr;
-}
-
-// Heurística para saber se é MP4 "válido" para WA Web
-function isProbablyMp4Video(filename?: string, contentType?: string) {
-  const ct = (contentType || '').toLowerCase();
-  const hasMp4Ct = ct === 'video/mp4' || ct.startsWith('video/mp4;');
-  const hasMp4Ext = !!(filename || '').toLowerCase().endsWith('.mp4');
-  return hasMp4Ct || hasMp4Ext;
-}
-
-// Transcodifica para MP4 (H.264/AAC) com flags compatíveis com WA
-async function transcodeToMp4(inputPath: string): Promise<string> {
-  const outPath = inputPath.endsWith('.mp4') ? inputPath : `${inputPath}.mp4`;
-  await new Promise<void>((resolve, reject) => {
-    const args = [
-      '-y', '-i', inputPath,
-
-      // vídeo: 1280 máx de largura, dimensões pares, H.264 yuv420p, faststart
-      '-vf', "scale='min(1280,iw)':'-2',pad=ceil(iw/2)*2:ceil(ih/2)*2",
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-profile:v', 'main',
-      '-level', '3.1',
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
-      '-crf', '23',
-
-      // áudio: AAC, 48 kHz (compat WA)
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-ar', '48000',
-
-      outPath
-    ];
-    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'inherit'] });
-    proc.on('error', reject);
-    proc.on('close', (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`)));
-  });
-  return outPath;
-}
-
-
-function isVideoAttachment(att: any, contentType?: string, name?: string) {
-  const t = String(att?.file_type || '').toLowerCase();
-  const ct = String(contentType || '').toLowerCase();
-  const n = String(name || att?.filename || '').toLowerCase();
-  // cobre os 3 jeitos que o Chatwoot costuma sinalizar
-  if (t === 'video') return true;
-  if (ct.startsWith('video/')) return true;
-  if (/\.(mp4|m4v|mov|3gp|webm)$/i.test(n)) return true;
-  return false;
-}
-
-// Timeout lógico para qualquer promise (não substitui os timeouts do Puppeteer)
-async function withCap<T>(factory: () => Promise<T>, ms = 120_000): Promise<T> {
-  let t: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race<T>([
-      factory(),
-      new Promise<T>((_, rej) => {
-        t = setTimeout(() => rej(new Error('TimeoutCap')), ms);
-      }),
-    ]);
-  } finally {
-    if (t) clearTimeout(t);
-  }
-}
-
-
-// Log “enxuto” do retorno do WPP para não poluir
-function summarizeSend(ret: any) {
-  if (!ret) return ret;
-  const { id, ack, to, mimetype, type } = ret as any;
-  return { id, ack, to, mimetype, type };
-}
-// Envia vídeo como data URL (fallback)
-async function sendVideoAsBase64(opts: {
-  client: any;
-  contato: string;
-  filePath: string;
-  filename: string;
-  caption: string;
-  mime: string; // ex: 'video/mp4'
-}) {
-  const { client, contato, filePath, filename, caption, mime } = opts;
-  const b64 = await fileToBase64(filePath);
-  const dataUrl = `data:${mime};base64,${b64}`;
-  await withRetry(() => client.sendFile(`${contato}`, dataUrl, filename, caption));
-}
-// Concatena stream de arquivo em base64 (tolerante a string|Buffer)
-async function fileToBase64(filePath: string): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    const rs = createReadStream(filePath); // NÃO defina .setEncoding()
-
-    rs.on('data', (chunk: unknown) => {        // aceita string | Buffer
-      if (Buffer.isBuffer(chunk)) {
-        chunks.push(chunk);
-      } else {
-        // se vier string por algum motivo, converte
-        chunks.push(Buffer.from(String(chunk)));
-      }
-    });
-    rs.once('error', reject);
-    rs.once('end', () => {
-      try {
-        resolve(Buffer.concat(chunks).toString('base64'));
-      } catch (e) { reject(e); }
-    });
-  });
-}
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
+
 export async function chatWoot(req: Request, res: Response): Promise<any> {
-  /**
-     #swagger.tags = ["Misc"]
-     #swagger.description = 'Webhook para eventos do Chatwoot.'
-     #swagger.autoBody=false
-     #swagger.security = [{ "bearerAuth": [] }]
-     #swagger.parameters["session"] = { schema: 'NERDWHATS_AMERICA' }
-  */
-  const { session } = req.params as any;
+  const { session } = req.params;
   const client: any = clientsArray[session];
   if (!client || client.status !== 'CONNECTED') {
-    return res.status(200).json({ status: 'ignored', reason: 'client-not-connected' });
-  }
-
-  // Campos principais do payload
-  const event: string | undefined = req.body?.event;
-  const message_type: string | undefined = req.body?.message_type;
-  const phone =
-    req.body?.conversation?.meta?.sender?.phone_number?.replace('+', '') ||
-    req.body?.phone;
-
-  // O Chatwoot costuma mandar o item novo em req.body.message
-  const msg: any = req.body?.message || req.body?.conversation?.messages?.[0] || {};
-
-  // Filtro: processa apenas "message_created" + "outgoing"
-  if (event !== 'message_created' || message_type !== 'outgoing') {
-    return res.status(200).json({ status: 'ignored', reason: 'event-or-type-mismatch' });
-  }
-
-  // Dedupe por message.id (evita reentregas/duplicidades)
-  const cwMsgId: string = String(msg?.id ?? req.body?.id ?? req.body?.message_id ?? '') || '';
-  if (cwMsgId && cwSeen(cwMsgId)) {
-    return res.status(200).json({ status: 'duplicate', message_id: cwMsgId });
-  }
-  if (cwMsgId) cwRemember(cwMsgId);
-
-  // ACK imediato para o Chatwoot (evita timeout e retries)
-  res.status(200).json({ status: 'queued', message_id: cwMsgId || null });
-
-  // Processamento assíncrono (não bloqueia o webhook)
-  setImmediate(async () => {
-    try {
-      if (!(await client.isConnected())) {
-        req.logger?.warn?.('chatWoot: client lost connection before send');
-        return;
-      }
-      if (!phone) {
-        req.logger?.warn?.('chatWoot: missing phone in payload');
-        return;
-      }
-
-      // Ajusta timeouts da Page/CDP para uploads grandes
-      adjustPageTimeouts(client, req.logger);
-
-    // --- BOT TAG: ignora mensagens que começam com @arqos quando habilitado ---
-    const botTagEnabled = !!client?.config?.chatWoot?.bot_tag;
-    const rawText = (msg?.content || '').trimStart();
-    if (botTagEnabled && rawText.toLowerCase().startsWith('@arqos')) {
-      req.logger?.info?.('[chatwoot] mensagem com @arqos ignorada por bot_tag=true', {
-        message_id: cwMsgId,
-        phone,
-      });
-      return; // não envia para o WhatsApp
-    }
-
-      // Assinatura (nome do atendente)
-      const agentName =
-        req.body?.message?.sender?.name ||
-        msg?.sender?.name ||
-        req.body?.user?.name ||
-        req.body?.sender?.name ||
-        null;
-
-      const makeSigned = (text?: string) => {
-        if (!agentName) return text ?? '';
-        const prefix = `*${agentName}:*`;
-        const t = (text || '').trim();
-        return t ? `${prefix}\n${t}` : prefix;
-      };
-
-      // Resolve URL do anexo (nunca base64)
-      const baseURL = (client?.config?.chatWoot?.baseURL || '').replace(/\/+$/, '');
-      const resolveAttachmentUrl = (att: any): string | null => {
-        const direct = att?.download_url || att?.downloadUrl || att?.url;
-        if (typeof direct === 'string' && /^https?:\/\//i.test(direct)) return direct;
-        const du = att?.data_url;
-        if (typeof du !== 'string') return null;
-        if (/^https?:\/\//i.test(du)) return du;
-        if (du.startsWith('/')) return `${baseURL}${du}`;
-        const railsIdx = du.indexOf('/rails/');
-        if (railsIdx >= 0) return `${baseURL}${du.substring(railsIdx)}`;
-        if (du.startsWith('data:')) return null; // ignorar base64
-        return `${baseURL}/${du.replace(/^\/+/, '')}`;
-      };
-
-      // Headers de auth para baixar do Chatwoot, quando necessário
-      const cwToken =
-        client?.config?.chatWoot?.token ||
-        client?.config?.chatWoot?.accessToken ||
-        null;
-      const cwAuthHeaderName =
-        client?.config?.chatWoot?.authHeaderName || 'Authorization';
-
-      const maybeAuthHeaders = (url: string): Record<string, string> | undefined => {
-        if (!cwToken || !baseURL) return undefined;
-        if (!url.startsWith(baseURL)) return undefined;
-        return cwAuthHeaderName.toLowerCase() === 'authorization'
-          ? { Authorization: `Bearer ${cwToken}` }
-          : { [cwAuthHeaderName]: String(cwToken) };
-      };
-
-      const destinos = contactToArray(phone, false);
-      const atts = Array.isArray(msg?.attachments) ? msg.attachments : [];
-      const caption = makeSigned(msg?.content || '');
-
-    if (atts.length > 0) {
-  const att = atts[0]; // mantém o primeiro anexo
-  const url = resolveAttachmentUrl(att);
-  if (!url) {
-    req.logger?.warn?.('[chatwoot] não foi possível resolver URL do anexo', { att });
-    for (const contato of destinos) {
-      await withRetry(() =>
-        client.sendText(contato, makeSigned('Não foi possível baixar o anexo.'))
-      );
-    }
+    // Se a sessão não existir ou não estiver conectada, não faz nada
     return;
   }
-
-  req.logger?.info?.('[chatwoot] baixando anexo…', {
-    file_type: att?.file_type,
-    filename: att?.filename,
-    url,
-  });
-
-  const { filePath, filename, contentType, cleanup } = await downloadToTemp({
-    url,
-    filename: att?.filename,
-    headers: maybeAuthHeaders(url),
-    timeoutMs: att?.file_type === 'video' ? 300_000 : 180_000,
-  });
-
-  req.logger?.info?.('[chatwoot] anexo baixado', {
-    filename,
-    contentType,
-    filePath,
-  });
-
   try {
-    // AUDIO → PTT
-    if (String(att?.file_type).toLowerCase() === 'audio') {
-      const name = (att?.filename && att.filename.trim()) || filename || 'Voice.ogg';
-      req.logger?.info?.('[chatwoot] enviando áudio (PTT)…', { name });
-      for (const contato of destinos) {
-        await withRetry(() => client.sendPtt(`${contato}`, filePath, name, caption));
-      }
-      return;
+    if (!(await client.isConnected())) {
+      // Se o cliente não estiver realmente conectado, finaliza sem erro
+      return res.status(200).json({ status: 'success', message: 'Session not connected' });
     }
 
-// ====================== VÍDEO ======================
-if (isVideoAttachment(att, contentType, filename)) {
-  let pathToSend: string = filePath;
-  let nameToSend: string =
-    (att?.filename && att.filename.trim()) || filename || 'video.mp4';
-
-  // Se não for claramente MP4, transcodifica para H.264/AAC
-  if (!isProbablyMp4Video(nameToSend, contentType)) {
-    req.logger?.info?.('[chatwoot] transcodificando vídeo → MP4 (H.264/AAC)…', {
-      filename: nameToSend,
-      contentType,
-    });
-    const mp4Path = await transcodeToMp4(filePath);
-    pathToSend = mp4Path;
-    if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
-  }
-
-  req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
-
-  try {
-    // 1) tentativa direta por caminho de arquivo
-    for (const contato of destinos) {
-      const r = await withRetry(() =>
-        client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
-      );
-      req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
+    const event = req.body.event;
+    const is_private = req.body.private || req.body.is_private;
+    // Ignora eventos de status da conversa ou mensagens privadas
+    if (
+      event === 'conversation_status_changed' ||
+      event === 'conversation_resolved' ||
+      is_private
+    ) {
+      return res
+        .status(200)
+        .json({ status: 'success', message: 'Success on receive chatwoot' });
     }
-  } catch (err) {
-    req.logger?.error?.(
-      '[chatwoot] sendFile(video) falhou, tentando fallback base64…',
-      { err: String((err as any)?.message ?? err) }
-    );
 
-    // 2) fallback: prepara base64 uma única vez
-    const mime =
-      contentType && contentType.startsWith('video/') ? contentType : 'video/mp4';
+    // Extrai detalhes da mensagem
+    const {
+      message_type,
+      // Número do remetente, removendo o '+' se existir
+      phone = req.body.conversation.meta.sender.phone_number.replace('+', ''),
+      // Conteúdo da primeira mensagem (texto ou anexos)
+      message = req.body.conversation.messages[0],
+    } = req.body;
 
-    // Lê o arquivo (sem encoding) -> Buffer[] -> base64
-    const b64: string = await fileToBase64(pathToSend);
+    // Só processa mensagens criadas e do tipo "outgoing" (enviadas)
+    if (event !== 'message_created' && message_type !== 'outgoing') {
+      return res
+        .status(200)
+        .json({ status: 'success', message: 'Success on receive chatwoot' });
+    }
 
-    const dataUrl = `data:${mime};base64,${b64}`;
+    const caption: string = message.content || '';
 
-    // Tenta várias formas porque mudam entre versões do WPPConnect
-    for (const contato of destinos) {
-      let delivered = false;
-      let lastErr: any;
+    // Envia a mensagem para cada contato da lista (pode ser múltiplos destinatários)
+    for (const contato of contactToArray(phone, false)) {
+      if (message_type === 'outgoing') {
+        // Se há anexos na mensagem
+        if (message.attachments && message.attachments.length > 0) {
+          // Prepara URL de download do anexo
+          const dataUrl = message.attachments[0].data_url;
+          const baseURL = client.config.chatWoot.baseURL || '';
+          const downloadUrl = `${baseURL}/${dataUrl.substring(dataUrl.indexOf('/rails/') + 1)}`;
+          req.logger?.info('[chatwoot] baixando anexo...', { url: downloadUrl });
 
-      const attempts: Array<[string, (() => Promise<any>) | undefined]> = [
-        [
-          'sendVideoFromBase64(pureB64)',
-          (client as any)?.sendVideoFromBase64
-            ? () => (client as any).sendVideoFromBase64(`${contato}`, b64, nameToSend, caption)
-            : undefined,
-        ],
-        [
-          'sendFileFromBase64(dataURL)',
-          (client as any)?.sendFileFromBase64
-            ? () => (client as any).sendFileFromBase64(`${contato}`, dataUrl, nameToSend, caption)
-            : undefined,
-        ],
-        [
-          'sendFile(dataURL)',
-          () => client.sendFile(`${contato}`, dataUrl, nameToSend, caption),
-        ],
-        [
-          'sendFile(pureB64, mime)',
-          // algumas builds aceitam base64 puro + mimetype como 5º arg
-          () => (client as any).sendFile(`${contato}`, b64, nameToSend, caption, mime),
-        ],
-      ];
-
-      for (const [label, call] of attempts) {
-        if (!call) {
-          req.logger?.info?.(`[chatwoot] ${label} indisponível; pulando`, { to: contato });
-          continue;
-        }
-        try {
-          const r = await withRetry(call);
-          req.logger?.info?.(`[chatwoot] ${label} OK`, { to: contato, result: r });
-          delivered = true;
-          break;
-        } catch (e: any) {
-          lastErr = e;
-          req.logger?.warn?.(`[chatwoot] ${label} falhou`, {
-            to: contato,
-            err: String(e?.message ?? e),
+          // Determina nome do arquivo (usa filename se disponível, caso contrário extrai da URL)
+          let filename = (message.attachments[0].filename || '').trim();
+          if (!filename) {
+            filename = downloadUrl.split('/').pop() || 'file';
+          }
+          // Caminho temporário para salvar o anexo
+          const filePath = path.join(os.tmpdir(), `${Date.now()}_${filename}`);
+          const writer = createWriteStream(filePath);
+          // Faz download do anexo para o arquivo local
+          const response = await axios.get(downloadUrl, { responseType: 'stream' });
+          await new Promise<void>((resolve, reject) => {
+            response.data.pipe(writer);
+            writer.on('finish', resolve);
+            writer.on('error', reject);
           });
+          req.logger?.info('[chatwoot] anexo baixado', { filePath });
+
+          // Se for áudio (PTT), envia como voice message
+          if (message.attachments[0].file_type === 'audio') {
+            req.logger?.info('[chatwoot] enviando áudio (PTT)...', { to: contato, file: filePath });
+            try {
+              await client.sendPtt(`${contato}`, filePath, 'Voice Audio', caption);
+              req.logger?.info('[chatwoot] sendPtt ok', { to: contato });
+            } catch (err) {
+              req.logger?.error('[chatwoot] sendPtt falhou', { to: contato, err: (err as any).message || err });
+            }
+          }
+          // Se for vídeo (baseado em file_type ou extensão)
+          else if (
+            message.attachments[0].file_type === 'video' ||
+            /\.(mp4|mov|mkv|avi)$/i.test(filename)
+          ) {
+            let pathToSend = filePath;
+            let nameToSend = filename;
+            // Se não for MP4 puro, tenta transcoding para H.264/AAC
+            if (!nameToSend.toLowerCase().endsWith('.mp4')) {
+              req.logger?.info('[chatwoot] transcodificando vídeo → MP4 (H.264/AAC)...', { filename: nameToSend });
+              try {
+                const mp4Path = await transcodeToMp4(filePath);
+                pathToSend = mp4Path;
+                // Ajusta extensão do nome se necessário
+                if (!nameToSend.toLowerCase().endsWith('.mp4')) {
+                  nameToSend = `${nameToSend}.mp4`;
+                }
+                // Remove arquivo original se transcoding criou novo arquivo
+                if (mp4Path !== filePath) {
+                  await unlinkAsync(filePath);
+                }
+              } catch (transErr) {
+                req.logger?.error('[chatwoot] falha na transcodificação de vídeo', { err: (transErr as any).message || transErr });
+                // Continua com o arquivo original se transcoding falhar
+              }
+            }
+
+            req.logger?.info('[chatwoot] enviando vídeo MP4...', { to: contato, nameToSend, pathToSend });
+            try {
+              // Envio normal por caminho de arquivo
+              await client.sendFile(`${contato}`, pathToSend, nameToSend, caption);
+              req.logger?.info('[chatwoot] sendFile(video) ok', { to: contato });
+            } catch (err) {
+              req.logger?.error('[chatwoot] sendFile(video) falhou, tentando fallback base64...', {
+                to: contato,
+                err: (err as any).message || err,
+              });
+              // Fallback: envia vídeo em base64 via Data URL
+              try {
+                const fileData = await streamFileToBase64(pathToSend);
+                const mime = (message.attachments[0].content_type && message.attachments[0].content_type.startsWith('video/'))
+                              ? message.attachments[0].content_type
+                              : 'video/mp4';
+                const data64 = `data:${mime};base64,${fileData}`;
+                await client.sendFile(`${contato}`, data64, nameToSend, caption);
+                req.logger?.info('[chatwoot] sendFile(video, base64) ok', { to: contato });
+              } catch (b64Err) {
+                req.logger?.error('[chatwoot] sendFile(video, base64) falhou', { to: contato, err: (b64Err as any).message || b64Err });
+              }
+            }
+          }
+          // Outros tipos de arquivo (imagem, PDF, etc.)
+          else {
+            req.logger?.info('[chatwoot] enviando arquivo...', { to: contato, file: filePath, filename });
+            try {
+              await client.sendFile(`${contato}`, filePath, filename, caption);
+              req.logger?.info('[chatwoot] sendFile(file) ok', { to: contato });
+            } catch (err) {
+              req.logger?.error('[chatwoot] sendFile(file) falhou, tentando fallback base64...', {
+                to: contato,
+                err: (err as any).message || err,
+              });
+              // Fallback: envia arquivo em base64 via Data URL
+              try {
+                const fileData = await streamFileToBase64(filePath);
+                const mime = message.attachments[0].content_type || 'application/octet-stream';
+                const data64 = `data:${mime};base64,${fileData}`;
+                await client.sendFile(`${contato}`, data64, filename, caption);
+                req.logger?.info('[chatwoot] sendFile(file, base64) ok', { to: contato });
+              } catch (b64Err) {
+                req.logger?.error('[chatwoot] sendFile(file, base64) falhou', { to: contato, err: (b64Err as any).message || b64Err });
+              }
+            }
+          }
+
+          // Limpeza: remove o arquivo baixado localmente
+          await unlinkAsync(filePath);
+        }
+        // Se não houver anexos, apenas envia texto
+        else {
+          req.logger?.info('[chatwoot] enviando texto...', { to: contato, content: caption });
+          try {
+            await client.sendText(contato, caption);
+            req.logger?.info('[chatwoot] sendText ok', { to: contato });
+          } catch (err) {
+            req.logger?.error('[chatwoot] sendText falhou', { to: contato, err: (err as any).message || err });
+          }
         }
       }
+    }
 
-      if (!delivered) {
-        req.logger?.error?.('[chatwoot] falha ao enviar vídeo via base64 (todas as tentativas)', {
-          to: contato,
-          err: String(lastErr?.message ?? lastErr),
-          mime,
-          nameToSend,
-        });
-      } else {
-        req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato });
-      }
-    }
-  } finally {
-    // se houve transcode, apaga o arquivo gerado
-    if (pathToSend !== filePath) {
-      try {
-        unlinkSync(pathToSend);
-      } catch {}
-    }
+    // Responde sucesso após processar todos
+    res.status(200).json({ status: 'success', message: 'Success on receive chatwoot' });
+  } catch (e) {
+    // Em caso de erro não previsto, log e retorna erro
+    req.logger?.error('[chatwoot] Error on receive chatwoot', { error: (e as any).message || e });
+    res.status(400).json({ status: 'error', message: 'Error on receive chatwoot', error: e });
   }
-  return;
 }
+
 
 // ====================== OUTROS TIPOS (imagem, pdf, etc) ======================
 const name = (att?.filename && att.filename.trim()) || filename || 'file';
