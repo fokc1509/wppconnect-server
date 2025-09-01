@@ -2469,33 +2469,36 @@ function isVideoAttachment(att: any, contentType?: string, name?: string) {
 
 
 // Fallback para enviar vídeo via base64 (quando for o caso)
-async function sendVideoAsBase64(
-  client: any,
-  contato: string,
-  filePath: string,
-  filename: string,
-  caption: string,
-  mime: string
-) {
-  // garanta que vamos lidar com Buffer, não string
-  const rs = createReadStream(filePath);      // NÃO setar .setEncoding()
-  const chunks: Buffer[] = [];
+async function sendVideoAsBase64(opts: {
+  client: any;
+  contato: string;
+  filePath: string;
+  filename: string;
+  caption: string;
+  mime?: string; // default 'video/mp4'
+}) {
+  const { client, contato, filePath, filename, caption, mime = 'video/mp4' } = opts;
 
-  await new Promise<void>((resolve, reject) => {
-    rs.on('data', (c: Buffer) => chunks.push(c));
-    rs.on('end', resolve);
-    rs.on('error', reject);
-  });
-
-  const buf: Buffer = Buffer.concat(chunks);        // <- agora é Buffer[]
-  const b64 = buf.toString('base64');
+  const b64 = await streamFileToBase64(filePath);
   const dataUrl = `data:${mime};base64,${b64}`;
 
-  // use a API do cliente que aceite base64 (ajuste o método conforme seu client)
-  await withRetry(() => client.sendFileFromBase64(contato, dataUrl, filename, caption));
+  await withRetry(() =>
+    // se seu client aceita data URL no sendFile, use sendFile; se tiver sendFileFromBase64, troque aqui:
+    client.sendFile(`${contato}`, dataUrl, filename, caption)
+  );
 }
 
 
+async function streamFileToBase64(filePath: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];           // <- sempre Buffer[]
+    const rs = createReadStream(filePath); // NÃO defina .setEncoding()
+
+    rs.on('data', (c: Buffer) => chunks.push(c));
+    rs.once('error', reject);
+    rs.once('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+  });
+}
 
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
@@ -2685,36 +2688,28 @@ if (isVideoAttachment(att, contentType, filename)) {
       );
       req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
     }
-  } catch (err) {
-    req.logger?.error?.(
-      '[chatwoot] sendFile(video) falhou, tentando fallback base64…',
-      { err: String((err as any)?.message ?? err) }
-    );
+} catch (err) {
+  req.logger?.error?.('[chatwoot] sendFile(video) falhou, tentando fallback base64…', {
+    err: String((err as any)?.message ?? err),
+  });
 
-    // 2) fallback: envia por base64 (tipado corretamente em Buffer[])
-    const b64: string = await new Promise<string>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      const s = createReadStream(pathToSend); // não definir encoding!
-      s.on('data', (c: Buffer) => chunks.push(c));
-      s.on('error', reject);
-      s.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
-    });
-
-    const mime = contentType && contentType.startsWith('video/')
+  const mime =
+    contentType && contentType.startsWith('video/')
       ? contentType
       : 'video/mp4';
 
-    for (const contato of destinos) {
-      const dataUrl = `data:${mime};base64,${b64}`;
-      const r = await withRetry(() =>
-        client.sendFile(`${contato}`, dataUrl, nameToSend, caption)
-      );
-      req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', {
-        to: contato,
-        result: r,
-      });
-    }
-  } finally {
+  for (const contato of destinos) {
+    await sendVideoAsBase64({
+      client,
+      contato,
+      filePath: pathToSend,
+      filename: nameToSend,
+      caption,
+      mime,
+    });
+    req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato });
+  }
+} finally {
     // se houve transcode, apaga o arquivo gerado
     if (pathToSend !== filePath) {
       try { unlinkSync(pathToSend); } catch {}
