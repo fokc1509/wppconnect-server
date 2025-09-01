@@ -2360,46 +2360,63 @@ function summarizeSend(ret: any) {
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
 export async function chatWoot(req: Request, res: Response): Promise<any> {
-  const { session } = req.params as any;
-  const client: any = clientsArray[session];
-
-  // ——— ACK IMEDIATO ———
-  if (!client) {
-    res.status(200).json({ status: 'ignored', reason: 'client-not-found' });
-    return;
+  // --- sempre ACK rápido para o Chatwoot ---
+  try {
+    if (!res.headersSent) {
+      res.status(200).json({ status: 'queued' });
+    }
+  } catch {
+    /* ignore */
   }
-  res.status(200).json({ status: 'queued' });
 
-  // ——— WORKER EM BACKGROUND ———
+  // daqui pra frente, nunca mais tocar no res/req-res lifecycle
   setImmediate(async () => {
+    const { session } = req.params as any;
+    const client: any = clientsArray[session];
+
     try {
-      if (client.status !== 'CONNECTED' || !(await client.isConnected())) {
-        req.logger?.warn?.('[chatwoot] client not connected when worker started', {
-          status: client.status,
-        });
+      // sanity checks
+      if (!client || client.status !== 'CONNECTED' || !(await client.isConnected())) {
+        req.logger?.warn?.('[chatwoot] client não conectado; ignorando');
         return;
       }
 
-      const event = req.body?.event;
-      const message_type = req.body?.message_type;
-      const is_private = req.body?.private || req.body?.is_private;
+      const event: string | undefined = req.body?.event;
+      const message_type: string | undefined = req.body?.message_type;
+      const isPrivate = !!(req.body?.private || req.body?.is_private);
 
-      if (event !== 'message_created' || message_type !== 'outgoing' || is_private) {
-        req.logger?.info?.('[chatwoot] ignored event', { event, message_type, is_private });
+      // filtra eventos que não interessam
+      if (
+        isPrivate ||
+        event === 'conversation_status_changed' ||
+        event === 'conversation_resolved'
+      ) {
+        req.logger?.info?.('[chatwoot] evento ignorado', { event, isPrivate });
         return;
       }
 
-      const phone =
+      // processa apenas created + outgoing
+      if (!(event === 'message_created' && message_type === 'outgoing')) {
+        req.logger?.info?.('[chatwoot] não é message_created/outgoing; ignorando', { event, message_type });
+        return;
+      }
+
+      // extrai dados básicos
+      const phone: string | undefined =
         req.body?.conversation?.meta?.sender?.phone_number?.replace('+', '') ||
         req.body?.phone;
+
+      const msg: any =
+        req.body?.message || req.body?.conversation?.messages?.[0] || {};
+
       if (!phone) {
-        req.logger?.warn?.('[chatwoot] missing phone in payload');
+        req.logger?.warn?.('[chatwoot] payload sem phone; abortando');
         return;
       }
 
-      // assinatura do atendente
-      const msg: any = req.body?.message || req.body?.conversation?.messages?.[0] || {};
+      // assinatura do atendente no texto
       const agentName =
+        req.body?.message?.sender?.name ||
         msg?.sender?.name ||
         req.body?.user?.name ||
         req.body?.sender?.name ||
@@ -2412,28 +2429,15 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
         return t ? `${prefix}\n${t}` : prefix;
       };
 
-      // destinos e conteúdo
+      // ajusta timeouts de navegação/CDP para uploads grandes
+      adjustPageTimeouts(client, req.logger);
+
       const destinos = contactToArray(phone, false);
       const atts = Array.isArray(msg?.attachments) ? msg.attachments : [];
       const caption = makeSigned(msg?.content || '');
 
-      // baseURL + auth headers p/ baixar do chatwoot quando necessário
+      // monta baseURL e resolvedor de URL de anexo
       const baseURL = (client?.config?.chatWoot?.baseURL || '').replace(/\/+$/, '');
-      const token =
-        client?.config?.chatWoot?.token ||
-        client?.config?.chatWoot?.accessToken ||
-        null;
-      const authHeaderName =
-        client?.config?.chatWoot?.authHeaderName || 'Authorization';
-
-      const maybeAuthHeaders = (url: string): Record<string, string> | undefined => {
-        if (!token || !baseURL) return undefined;
-        if (!url.startsWith(baseURL)) return undefined;
-        return authHeaderName.toLowerCase() === 'authorization'
-          ? { Authorization: `Bearer ${token}` }
-          : { [authHeaderName]: String(token) };
-      };
-
       const resolveAttachmentUrl = (att: any): string | null => {
         const direct = att?.download_url || att?.downloadUrl || att?.url;
         if (typeof direct === 'string' && /^https?:\/\//i.test(direct)) return direct;
@@ -2443,28 +2447,41 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
         if (du.startsWith('/')) return `${baseURL}${du}`;
         const railsIdx = du.indexOf('/rails/');
         if (railsIdx >= 0) return `${baseURL}${du.substring(railsIdx)}`;
-        if (du.startsWith('data:')) return null; // ignorar base64 do chatwoot
+        if (du.startsWith('data:')) return null; // ignorar base64 vindo do chatwoot
         return `${baseURL}/${du.replace(/^\/+/, '')}`;
       };
 
-      // ======= COM ANEXO =======
+      // auth header p/ baixar do Chatwoot quando for mesma origem
+      const cwToken =
+        client?.config?.chatWoot?.token ||
+        client?.config?.chatWoot?.accessToken ||
+        null;
+      const cwAuthHeaderName =
+        client?.config?.chatWoot?.authHeaderName || 'Authorization';
+      const maybeAuthHeaders = (url: string): Record<string, string> | undefined => {
+        if (!cwToken || !baseURL) return undefined;
+        if (!url.startsWith(baseURL)) return undefined;
+        return cwAuthHeaderName.toLowerCase() === 'authorization'
+          ? { Authorization: `Bearer ${cwToken}` }
+          : { [cwAuthHeaderName]: String(cwToken) };
+      };
+
+      // ============ COM ANEXO ============
       if (atts.length > 0) {
-        const att = atts[0]; // 1º anexo
+        const att = atts[0];
         const url = resolveAttachmentUrl(att);
         if (!url) {
           req.logger?.warn?.('[chatwoot] não foi possível resolver URL do anexo', { att });
           for (const contato of destinos) {
-            await withRetry(() =>
-              client.sendText(contato, makeSigned('Não foi possível baixar o anexo.'))
-            );
+            await withRetry(() => client.sendText(contato, makeSigned('Não foi possível baixar o anexo.')));
           }
           return;
         }
 
         req.logger?.info?.('[chatwoot] baixando anexo…', {
-          url,
-          filename: att?.filename,
           file_type: att?.file_type,
+          filename: att?.filename,
+          url,
         });
 
         const { filePath, filename, contentType, cleanup } = await downloadToTemp({
@@ -2474,13 +2491,15 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
           timeoutMs: String(att?.file_type).toLowerCase() === 'video' ? 300_000 : 180_000,
         });
 
-        req.logger?.info?.('[chatwoot] anexo baixado', { filePath, filename, contentType });
+        req.logger?.info?.('[chatwoot] anexo baixado', {
+          filename,
+          contentType,
+          filePath,
+        });
 
         try {
-          const fileType = String(att?.file_type || '').toLowerCase();
-
-          // —— ÁUDIO → PTT ——
-          if (fileType === 'audio') {
+          // ÁUDIO → PTT
+          if (String(att?.file_type).toLowerCase() === 'audio') {
             const name = (att?.filename && att.filename.trim()) || filename || 'Voice.ogg';
             req.logger?.info?.('[chatwoot] enviando áudio (PTT)…', { name });
             for (const contato of destinos) {
@@ -2489,13 +2508,12 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
             return;
           }
 
-          // —— VÍDEO ——
+          // VÍDEO
           if (isVideoAttachment(att, contentType, filename)) {
             let pathToSend = filePath;
             let nameToSend =
               (att?.filename && att.filename.trim()) || filename || 'video.mp4';
 
-            // transcode se não for claramente MP4
             if (!isProbablyMp4Video(nameToSend, contentType)) {
               req.logger?.info?.('[chatwoot] transcodificando vídeo → MP4 (H.264/AAC)…', {
                 filename: nameToSend,
@@ -2506,7 +2524,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
                 pathToSend = mp4Path;
                 if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
               } catch (e: any) {
-                req.logger?.warn?.('[chatwoot] falha na transcodificação; tentando original', {
+                req.logger?.warn?.('[chatwoot] transcode falhou; tentando enviar original', {
                   err: String(e?.message ?? e),
                 });
               }
@@ -2515,76 +2533,73 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
             req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
 
             try {
-              // envio direto por arquivo
               for (const contato of destinos) {
                 const r = await withRetry(() =>
                   client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
                 );
-                req.logger?.info?.('[chatwoot] sendFile(video) ok', {
-                  to: contato,
-                  result: summarizeSend(r),
-                });
+                req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: summarizeSend(r) });
               }
+              return; // vídeo entregue — fim
             } catch (err: any) {
-              // fallback base64
-              req.logger?.error?.('[chatwoot] sendFile(video) falhou — fallback base64', {
+              req.logger?.error?.('[chatwoot] sendFile(video) falhou, tentando fallback base64…', {
                 err: String(err?.message ?? err),
               });
 
+              // fallback base64 (gera uma vez e reusa)
               const mime =
-                contentType && contentType.startsWith('video/')
-                  ? contentType
-                  : 'video/mp4';
+                contentType && contentType.startsWith('video/') ? contentType : 'video/mp4';
               const b64 = await fileToBase64(pathToSend);
               const dataUrl = `data:${mime};base64,${b64}`;
 
               for (const contato of destinos) {
-                const r = await withRetry(() =>
-                  client.sendFile(`${contato}`, dataUrl, nameToSend, caption)
-                );
-                req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', {
-                  to: contato,
-                  result: summarizeSend(r),
-                });
+                try {
+                  const r = await withRetry(() =>
+                    (client as any).sendFile(`${contato}`, dataUrl, nameToSend, caption)
+                  );
+                  req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato, result: summarizeSend(r) });
+                } catch (e: any) {
+                  req.logger?.error?.('[chatwoot] sendFile(video, base64) falhou', {
+                    to: contato,
+                    err: String(e?.message ?? e),
+                  });
+                }
               }
+              return;
             } finally {
+              // se houve transcode, apaga o arquivo gerado
               if (pathToSend !== filePath) {
                 try { unlinkSync(pathToSend); } catch {}
               }
             }
-            return;
           }
 
-          // —— OUTROS TIPOS (imagem, pdf, etc.) ——
+          // OUTROS TIPOS (imagem, pdf, doc, etc.)
           const name = (att?.filename && att.filename.trim()) || filename || 'file';
           req.logger?.info?.('[chatwoot] enviando arquivo…', { name, contentType });
           for (const contato of destinos) {
-            const r = await withRetry(() =>
-              client.sendFile(`${contato}`, filePath, name, caption)
-            );
-            req.logger?.info?.('[chatwoot] sendFile(file) ok', {
-              to: contato,
-              result: summarizeSend(r),
-            });
+            const r = await withRetry(() => client.sendFile(`${contato}`, filePath, name, caption));
+            req.logger?.info?.('[chatwoot] sendFile ok', { to: contato, result: summarizeSend(r) });
           }
         } finally {
-          cleanup();
+          // limpa o arquivo baixado
+          try { cleanup(); } catch {}
         }
         return;
       }
 
-      // ======= SEM ANEXO → TEXTO =======
+      // ============ SEM ANEXO → TEXTO ============
       for (const contato of destinos) {
-        await withRetry(() => client.sendText(contato, caption));
+        const r = await withRetry(() => client.sendText(contato, caption));
+        req.logger?.info?.('[chatwoot] sendText ok', { to: contato, result: summarizeSend(r) });
       }
     } catch (err: any) {
-      try {
-        req.logger?.error?.('[chatwoot] worker fatal', { err: String(err?.message ?? err) });
-      } catch {}
+      req.logger?.error?.('[chatwoot] erro no processamento assíncrono', {
+        err: String(err?.message ?? err),
+        stack: err?.stack,
+      });
     }
-  });
+  }); // fim setImmediate
 }
-
 
 // ===================== FIM FUNCAO CHATWOOT =====================
 
