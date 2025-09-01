@@ -2424,16 +2424,28 @@ function isProbablyMp4Video(filename?: string, contentType?: string) {
   return hasMp4Ct || hasMp4Ext;
 }
 
-// Transcodifica para MP4 (H.264/AAC) usando ffmpeg (precisa estar instalado no container)
+// Transcodifica para MP4 (H.264/AAC) com flags compatíveis com WA
 async function transcodeToMp4(inputPath: string): Promise<string> {
-  // gera saída ao lado do arquivo original
   const outPath = inputPath.endsWith('.mp4') ? inputPath : `${inputPath}.mp4`;
   await new Promise<void>((resolve, reject) => {
     const args = [
       '-y', '-i', inputPath,
-      '-vf', "scale='min(1280,iw)':'-2'",    // limita largura a 1280 (mantém proporção)
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-      '-c:a', 'aac', '-b:a', '128k',
+
+      // vídeo: 1280 máx de largura, dimensões pares, H.264 yuv420p, faststart
+      '-vf', "scale='min(1280,iw)':'-2',pad=ceil(iw/2)*2:ceil(ih/2)*2",
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-profile:v', 'main',
+      '-level', '3.1',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      '-crf', '23',
+
+      // áudio: AAC, 48 kHz (compat WA)
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-ar', '48000',
+
       outPath
     ];
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'inherit'] });
@@ -2442,6 +2454,7 @@ async function transcodeToMp4(inputPath: string): Promise<string> {
   });
   return outPath;
 }
+
 
 function isVideoAttachment(att: any, contentType?: string, name?: string) {
   const t = String(att?.file_type || '').toLowerCase();
@@ -2618,63 +2631,60 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
 
     // VÍDEO (detecção robusta)
     if (isVideoAttachment(att, contentType, filename)) {
-      let pathToSend = filePath;
-      let nameToSend =
-        (att?.filename && att.filename.trim()) || filename || 'video.mp4';
+// já estamos dentro do if (isVideoAttachment(...)) { … }
 
-      // garante MP4/H.264 + AAC
-      if (!isProbablyMp4Video(nameToSend, contentType)) {
-        req.logger?.info?.('[chatwoot] transcodificando vídeo → MP4 (H.264/AAC)…', {
-          filename: nameToSend,
-          contentType,
-        });
-        const mp4Path = await transcodeToMp4(filePath);
-        pathToSend = mp4Path;
-        if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
-        try {
-          req.logger?.info?.('[chatwoot] enviando vídeo (mp4)…', { nameToSend, pathToSend });
-          for (const contato of destinos) {
-            await withRetry(() => client.sendFile(`${contato}`, pathToSend, nameToSend, caption));
-          }
-        } catch (err) {
-          req.logger?.error?.('[chatwoot] erro sendFile(video mp4), tentando fallback sendVideo…', {
-            err: String((err as any)?.message ?? err),
-          });
-          // fallback se existir API nativa de vídeo
-          if (typeof client?.sendVideo === 'function') {
-            for (const contato of destinos) {
-              await withRetry(() => client.sendVideo(`${contato}`, pathToSend, nameToSend, caption));
-            }
-          } else {
-            throw err;
-          }
-        } finally {
-          try { unlinkSync(pathToSend); } catch {}
-        }
-        return;
-      }
+let pathToSend = filePath;
+let nameToSend = (att?.filename && att.filename.trim()) || filename || 'video.mp4';
 
-      // já é MP4
-      if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
-      req.logger?.info?.('[chatwoot] enviando vídeo MP4 direto…', { nameToSend, path: pathToSend });
-      try {
-        for (const contato of destinos) {
-          await withRetry(() => client.sendFile(`${contato}`, pathToSend, nameToSend, caption));
-        }
-      } catch (err) {
-        req.logger?.error?.('[chatwoot] erro sendFile(video mp4), tentando fallback sendVideo…', {
-          err: String((err as any)?.message ?? err),
-        });
-        if (typeof client?.sendVideo === 'function') {
-          for (const contato of destinos) {
-            await withRetry(() => client.sendVideo(`${contato}`, pathToSend, nameToSend, caption));
-          }
-        } else {
-          throw err;
-        }
-      }
-      return;
-    }
+// se não for claramente MP4, transcodifica
+if (!isProbablyMp4Video(nameToSend, contentType)) {
+  req.logger?.info?.('[chatwoot] transcodificando vídeo → MP4 (H.264/AAC)…', {
+    filename: nameToSend,
+    contentType,
+  });
+  const mp4Path = await transcodeToMp4(filePath);
+  pathToSend = mp4Path;
+  if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
+}
+
+req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
+
+try {
+  // 1) tentativa por caminho de arquivo
+  for (const contato of destinos) {
+    const r = await withRetry(() =>
+      client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
+    );
+    req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
+  }
+} catch (err) {
+  req.logger?.error?.('[chatwoot] sendFile(video) falhou, tentando fallback base64…', {
+    err: String((err as any)?.message ?? err),
+  });
+
+  // 2) fallback: envia por base64
+  const b64 = await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const s = createReadStream(pathToSend);
+    s.on('data', (c) => chunks.push(c));
+    s.on('error', reject);
+    s.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+  });
+
+  for (const contato of destinos) {
+    const r = await withRetry(() =>
+      client.sendFile(`${contato}`, `data:video/mp4;base64,${b64}`, nameToSend, caption)
+    );
+    req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato, result: r });
+  }
+} finally {
+  // se houve transcode, apaga o arquivo gerado
+  if (pathToSend !== filePath) {
+    try { unlinkSync(pathToSend); } catch {}
+  }
+ }
+return;
+}
 
     // OUTROS TIPOS (imagem, pdf, etc)
     const name = (att?.filename && att.filename.trim()) || filename || 'file';
