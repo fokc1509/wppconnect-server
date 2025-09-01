@@ -2293,22 +2293,7 @@ export async function safeUnlink(p: string) {
   try { await fsp.unlink(p); } catch {}
 }
 
-// Dedupe de eventos Chatwoot (em memória)
-const CW_DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutos
-const cwProcessedIds: Map<string, number> = new Map();
 
-function cwSeen(id: string): boolean {
-  const t = cwProcessedIds.get(id);
-  return !!t && (Date.now() - t) < CW_DEDUPE_TTL_MS;
-}
-function cwRemember(id: string) {
-  cwProcessedIds.set(id, Date.now());
-  // limpeza oportunista
-  const now = Date.now();
-  for (const [k, v] of cwProcessedIds) {
-    if ((now - v) > CW_DEDUPE_TTL_MS) cwProcessedIds.delete(k);
-  }
-}
 // ----- DEDUPE (10 min) ----- Corrigir erro de timeout no chatwoot
 const CW_DEDUPE_TTL_MS = 10 * 60 * 1000;
 const cwProcessedIds: Map<string, number> = new Map();
@@ -2473,7 +2458,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
                   to: contato, err: (err as any)?.message || err
                 });
                 try {
-                  const b64 = await streamFileToBase64(pathToSend);
+                  const b64 = await fileToBase64(pathToSend);
                   const mime = (att?.content_type && String(att.content_type).startsWith('video/'))
                     ? att.content_type
                     : 'video/mp4';
@@ -2499,7 +2484,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
                 to: contato, err: (err as any)?.message || err
               });
               try {
-                const b64 = await streamFileToBase64(filePath);
+                const b64 = await fileToBase64(filePath);
                 const mime = att?.content_type || 'application/octet-stream';
                 const data64 = `data:${mime};base64,${b64}`;
                 await client.sendFile(`${contato}`, data64, filename, caption);
