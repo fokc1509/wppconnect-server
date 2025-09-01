@@ -29,9 +29,7 @@ import { randomUUID } from 'crypto';
 import { spawn } from 'child_process'; // <— adicione este import
 import http from 'node:http';
 import https from 'node:https';
-import dns from 'node:dns';
-const pipeline = promisify(_pipeline);
-
+import * as dns from 'node:dns';                // <-- importe como namespace
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
   res.status(201).json({
@@ -2228,13 +2226,21 @@ export async function getVotes(req: Request, res: Response) {
 }
 // FUNCOES CHATWOOT
 // ========== helper robusto para download (IPv4, keepalive, redirect-safe, proxy-aware) ==========
-const lookup4: dns.LookupFunction = (hostname, _opts: any, cb: any) => {
-  // força IPv4; se quiser tentar v6 depois, implemente fallback aqui
-  dns.lookup(hostname, { family: 4, all: false }, cb);
+const lookup4 = (
+  hostname: string,
+  _opts: any,
+  cb: (err: NodeJS.ErrnoException | null, address: string, family?: number) => void
+) => {
+  dns.lookup(hostname, { family: 4, all: false }, cb as any);
 };
 
 const httpAgentKA = new http.Agent({ keepAlive: true, maxSockets: 12, scheduling: 'lifo' as any });
-const httpsAgentKA = new https.Agent({ keepAlive: true, maxSockets: 12, scheduling: 'lifo' as any, rejectUnauthorized: true });
+const httpsAgentKA = new https.Agent({
+  keepAlive: true,
+  maxSockets: 12,
+  scheduling: 'lifo' as any,
+  rejectUnauthorized: true
+});
 
 function shouldBypassProxy(urlStr: string): boolean {
   // honra NO_PROXY: lista separada por vírgula, suporta host:port e sufixos
