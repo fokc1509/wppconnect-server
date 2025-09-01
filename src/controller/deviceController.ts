@@ -2222,16 +2222,22 @@ export async function getVotes(req: Request, res: Response) {
       .json({ status: 'error', message: 'Error on get votes', error: error });
   }
 }
-
+// funcoes de auxilio chatwoot
 async function downloadToTemp(opts: {
   url: string;
   filename?: string;
   headers?: Record<string, string>;
   timeoutMs?: number;
+  client?: any; // <-- passe o client aqui quando chamar
 }) {
-  const { url, filename, headers, timeoutMs = 120000 } = opts;
+  const { url, filename, headers, timeoutMs = 180000, client } = opts; // 180s
+  const target = new URL(url);
 
-  const resp = await axios({
+  // Resolver proxy (config.ts ou env). Retorna objeto, 'bypass' ou null.
+  const proxyResolved = resolveAxiosProxyFor(url, client);
+
+  // Montar opções base do Axios (forçando IPv4)
+  const baseAxiosCfg: any = {
     method: 'GET',
     url,
     responseType: 'stream',
@@ -2239,30 +2245,53 @@ async function downloadToTemp(opts: {
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
     headers,
-    validateStatus: (s) => s >= 200 && s < 400, // aceita redirects
-  });
-
-  const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
-  const name =
-    filename ||
-    url.split('?')[0].split('/').pop() ||
-    `file-${randomUUID()}`;
-  const filePath = join(dir, name);
-
-  await pipeline(resp.data, createWriteStream(filePath));
-
-  const contentType = resp.headers['content-type'] || '';
-  return {
-    filePath,
-    filename: name,
-    contentType,
-    cleanup: () => {
-      try {
-        unlinkSync(filePath);
-      } catch {}
-    },
+    validateStatus: (s: number) => s >= 200 && s < 400,
+    family: 4, // força IPv4
   };
+
+  if (proxyResolved === 'bypass') {
+    // Não usar proxy
+    baseAxiosCfg.proxy = false;
+  } else if (proxyResolved) {
+    baseAxiosCfg.proxy = proxyResolved;
+  } else {
+    // Sem proxy configurado: também explicita proxy=false p/ evitar heurísticas
+    baseAxiosCfg.proxy = false;
+  }
+
+  // Pequeno retry/backoff só para erros de rede típicos
+  const MAX_ATTEMPTS = 2;
+  let lastErr: any = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const resp = await axios(baseAxiosCfg);
+      const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
+      const name = filename || target.pathname.split('/').pop() || `file-${randomUUID()}`;
+      const filePath = join(dir, name);
+      await pipeline(resp.data, createWriteStream(filePath));
+      const contentType = resp.headers['content-type'] || '';
+
+      return {
+        filePath,
+        filename: name,
+        contentType,
+        cleanup: () => {
+          try { unlinkSync(filePath); } catch {}
+        },
+      };
+    } catch (err: any) {
+      lastErr = err;
+      const code = err?.code || err?.cause?.code;
+      const transient = ['ETIMEDOUT', 'ENETUNREACH', 'ECONNRESET', 'ECONNREFUSED'].includes(code);
+      if (!transient || attempt === MAX_ATTEMPTS) break;
+      // backoff simples
+      await new Promise(r => setTimeout(r, attempt * 1000));
+    }
+  }
+
+  throw lastErr;
 }
+
 
 // ===================== HELPERS (Topo do arquivo) =====================
 
@@ -2341,6 +2370,58 @@ async function transcodeToMp4(inputPath: string): Promise<string> {
   });
   return outPath;
 }
+// Helpers de proxy/IPv4 para Axios
+function parseProxyFromEnv(): { protocol: string; host: string; port: number; auth?: { username: string; password: string } } | null {
+  const raw = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    return {
+      protocol: (u.protocol || 'http:').replace(':', ''),
+      host: u.hostname,
+      port: u.port ? Number(u.port) : 8080,
+      auth: u.username ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password || '') } : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function shouldBypassProxy(host: string, noProxyEnv?: string): boolean {
+  const list = (noProxyEnv || process.env.NO_PROXY || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.length) return false;
+  return list.some(entry => {
+    if (entry === '*') return true;
+    if (entry.startsWith('.')) return host.endsWith(entry);
+    return host === entry || host.endsWith(`.${entry}`);
+  });
+}
+
+function resolveAxiosProxyFor(urlStr: string, client?: any) {
+  // 1) Preferir proxy do config.ts (se você adicionou algo como client.config.network.proxyUrl)
+  const cfgUrl = client?.config?.network?.proxyUrl || client?.config?.chatWoot?.proxyUrl;
+  const raw = cfgUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  if (!raw) return null;
+
+  const target = new URL(urlStr);
+  if (shouldBypassProxy(target.hostname, client?.config?.network?.noProxy || process.env.NO_PROXY)) {
+    return 'bypass';
+  }
+
+  try {
+    const u = new URL(raw);
+    return {
+      protocol: (u.protocol || 'http:').replace(':', ''),
+      host: u.hostname,
+      port: u.port ? Number(u.port) : 8080,
+      auth: u.username ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password || '') } : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
 export async function chatWoot(req: Request, res: Response): Promise<any> {
@@ -2462,7 +2543,8 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
           url,
           filename: att?.filename,
           headers: maybeAuthHeaders(url),
-        });
+          client, // <-- passe o client para que o helper veja config/network/env
+         });
 
         try {
           // AUDIO → PTT como antes
