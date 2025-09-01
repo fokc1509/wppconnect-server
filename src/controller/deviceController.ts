@@ -2356,6 +2356,59 @@ function summarizeSend(ret: any) {
   const { id, ack, to, mimetype, type } = ret as any;
   return { id, ack, to, mimetype, type };
 }
+// Ajusta timeouts da Page/CDP (Puppeteer) para uploads/gravações longas
+export function adjustPageTimeouts(client: any, logger?: any, ms = 300_000) {
+  try {
+    const page: any = client?.page;
+
+    // 1) Timeouts de alto nível do Puppeteer
+    if (page?.setDefaultTimeout) {
+      page.setDefaultTimeout(ms);
+    }
+    if (page?.setDefaultNavigationTimeout) {
+      page.setDefaultNavigationTimeout(ms);
+    }
+
+    // 2) Tentar alcançar a conexão CDP para aumentar o protocolo (evita timeouts em operações grandes)
+    // Há diferenças entre versões do Puppeteer; tentamos múltiplos caminhos com segurança.
+    let cdpSession: any;
+    try {
+      // Puppeteer v13+ costuma expor _client() como função
+      if (typeof page?._client === 'function') {
+        cdpSession = page._client();
+      } else if (page?._client) {
+        // algumas versões expõem como propriedade
+        cdpSession = page._client;
+      }
+    } catch { /* ignore */ }
+
+    let cdpConn: any;
+    try {
+      if (cdpSession?.connection && typeof cdpSession.connection === 'function') {
+        cdpConn = cdpSession.connection();
+      } else if (cdpSession?.connection) {
+        cdpConn = cdpSession.connection;
+      }
+    } catch { /* ignore */ }
+
+    try {
+      if (cdpConn && typeof cdpConn.setProtocolTimeout === 'function') {
+        cdpConn.setProtocolTimeout(ms);
+      }
+    } catch { /* ignore */ }
+
+    logger?.info?.('[chatwoot] timeouts ajustados', {
+      defaultTimeout: ms,
+      navTimeout: ms,
+      protocolTimeout: ms,
+    });
+  } catch (e: any) {
+    logger?.warn?.('[chatwoot] falha ao ajustar timeouts', {
+      err: String(e?.message ?? e),
+    });
+  }
+}
+
 
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
