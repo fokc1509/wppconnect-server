@@ -30,7 +30,6 @@ import { spawn } from 'child_process'; // <— adicione este import
 import http from 'node:http';
 import https from 'node:https';
 import * as dns from 'node:dns';                // <-- importe como namespace
-import { pipeline } from 'node:stream/promises';
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
   res.status(201).json({
