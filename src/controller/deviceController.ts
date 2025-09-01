@@ -27,6 +27,10 @@ import { join } from 'path';
 import { pipeline } from 'node:stream/promises';
 import { randomUUID } from 'crypto';
 import { spawn } from 'child_process'; // <— adicione este import
+import http from 'node:http';
+import https from 'node:https';
+import dns from 'node:dns';
+const pipeline = promisify(_pipeline);
 
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
@@ -2222,78 +2226,118 @@ export async function getVotes(req: Request, res: Response) {
       .json({ status: 'error', message: 'Error on get votes', error: error });
   }
 }
-// funcoes de auxilio chatwoot
-async function downloadToTemp(opts: {
-  url: string;
-  filename?: string;
-  headers?: Record<string, string>;
-  timeoutMs?: number;
-  client?: any; // <-- passe o client aqui quando chamar
-}) {
-  const { url, filename, headers, timeoutMs = 180000, client } = opts; // 180s
-  const target = new URL(url);
+// FUNCOES CHATWOOT
+// ========== helper robusto para download (IPv4, keepalive, redirect-safe, proxy-aware) ==========
+const lookup4: dns.LookupFunction = (hostname, _opts: any, cb: any) => {
+  // força IPv4; se quiser tentar v6 depois, implemente fallback aqui
+  dns.lookup(hostname, { family: 4, all: false }, cb);
+};
 
-  // Resolver proxy (config.ts ou env). Retorna objeto, 'bypass' ou null.
-  const proxyResolved = resolveAxiosProxyFor(url, client);
+const httpAgentKA = new http.Agent({ keepAlive: true, maxSockets: 12, scheduling: 'lifo' as any });
+const httpsAgentKA = new https.Agent({ keepAlive: true, maxSockets: 12, scheduling: 'lifo' as any, rejectUnauthorized: true });
 
-  // Montar opções base do Axios (forçando IPv4)
-  const baseAxiosCfg: any = {
+function shouldBypassProxy(urlStr: string): boolean {
+  // honra NO_PROXY: lista separada por vírgula, suporta host:port e sufixos
+  const noProxy = (process.env.NO_PROXY || process.env.no_proxy || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (noProxy.length === 0) return false;
+  try {
+    const u = new URL(urlStr);
+    const host = u.hostname.toLowerCase();
+    const hostPort = u.port ? `${host}:${u.port}` : host;
+    return noProxy.some(rule => {
+      const r = rule.toLowerCase();
+      if (r === '*' ) return true;
+      if (host === r || hostPort === r) return true;
+      // sufixo .dominio
+      if (r.startsWith('.')) return host.endsWith(r);
+      // sem ponto: trata como sufixo também
+      return host.endsWith(r);
+    });
+  } catch { return false; }
+}
+
+async function axiosGetStream(url: string, timeoutMs: number, extraHeaders?: Record<string, string>) {
+  const useProxy = !shouldBypassProxy(url);
+  // O Axios 1.x usa follow-redirects; precisamos re-aplicar lookup/agents em cada redirect
+  return axios({
     method: 'GET',
     url,
     responseType: 'stream',
     timeout: timeoutMs,
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
-    headers,
-    validateStatus: (s: number) => s >= 200 && s < 400,
-    family: 4, // força IPv4
-  };
-
-  if (proxyResolved === 'bypass') {
-    // Não usar proxy
-    baseAxiosCfg.proxy = false;
-  } else if (proxyResolved) {
-    baseAxiosCfg.proxy = proxyResolved;
-  } else {
-    // Sem proxy configurado: também explicita proxy=false p/ evitar heurísticas
-    baseAxiosCfg.proxy = false;
-  }
-
-  // Pequeno retry/backoff só para erros de rede típicos
-  const MAX_ATTEMPTS = 2;
-  let lastErr: any = null;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const resp = await axios(baseAxiosCfg);
-      const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
-      const name = filename || target.pathname.split('/').pop() || `file-${randomUUID()}`;
-      const filePath = join(dir, name);
-      await pipeline(resp.data, createWriteStream(filePath));
-      const contentType = resp.headers['content-type'] || '';
-
-      return {
-        filePath,
-        filename: name,
-        contentType,
-        cleanup: () => {
-          try { unlinkSync(filePath); } catch {}
-        },
-      };
-    } catch (err: any) {
-      lastErr = err;
-      const code = err?.code || err?.cause?.code;
-      const transient = ['ETIMEDOUT', 'ENETUNREACH', 'ECONNRESET', 'ECONNREFUSED'].includes(code);
-      if (!transient || attempt === MAX_ATTEMPTS) break;
-      // backoff simples
-      await new Promise(r => setTimeout(r, attempt * 1000));
-    }
-  }
-
-  throw lastErr;
+    // importantíssimo: plugar lookup IPv4 e keepalive agentes
+    httpAgent: httpAgentKA,
+    httpsAgent: httpsAgentKA,
+    // Axios expõe follow-redirects options:
+    maxRedirects: 5,
+    // @ts-ignore
+    lookup: lookup4, // para a 1a requisição (follow-redirects também usa de base)
+    // @ts-ignore
+    beforeRedirect: (options: any, _responseDetails: any) => {
+      // re-aplica tudo a cada hop
+      options.lookup = lookup4;
+      options.agents = { http: httpAgentKA, https: httpsAgentKA };
+      options.agent = options.protocol === 'http:' ? httpAgentKA : httpsAgentKA;
+      // se estiver usando proxy no ambiente, deixe o follow-redirects decidir; se quiser
+      // FORÇAR bypass nesse host, já tratamos com NO_PROXY acima
+    },
+    headers: {
+      'User-Agent': 'wppconnect-media-fetch/1.0',
+      'Accept': '*/*',
+      ...(extraHeaders || {}),
+    },
+    // Se você estiver usando axios proxy nativo e quiser desativar quando NO_PROXY casar:
+    proxy: useProxy ? undefined : false,
+    decompress: true,
+    transitional: { clarifyTimeoutError: true },
+    validateStatus: s => s >= 200 && s < 400, // aceita 3xx para o follow-redirects
+  });
 }
 
+export async function downloadToTemp(opts: {
+  url: string;
+  filename?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+}) {
+  const { url, filename, headers, timeoutMs = 180_000 } = opts;
 
-// ===================== HELPERS (Topo do arquivo) =====================
+  // retry leve (3 tentativas)
+  const attempts = 3;
+  let lastErr: any;
+  let resp: any;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      resp = await axiosGetStream(url, timeoutMs, headers);
+      break;
+    } catch (err: any) {
+      lastErr = err;
+      // erros de rede transitórios → pequeno backoff e tenta de novo
+      const code = err?.code || err?.cause?.code;
+      if (['ETIMEDOUT', 'ECONNRESET', 'ENETUNREACH', 'EAI_AGAIN', 'EHOSTUNREACH'].includes(code)) {
+        await new Promise(r => setTimeout(r, 500 * (i + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  if (!resp) throw lastErr || new Error('download failed without response');
+
+  const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
+  const name = filename || (url.split('?')[0].split('/').pop() || `file-${randomUUID()}`);
+  const filePath = join(dir, name);
+  await pipeline(resp.data, createWriteStream(filePath));
+  const contentType = resp.headers?.['content-type'] || '';
+
+  return {
+    filePath,
+    filename: name,
+    contentType,
+    cleanup: () => { try { unlinkSync(filePath); } catch {} },
+  };
+}
 
 // Dedupe de eventos Chatwoot (em memória)
 const CW_DEDUPE_TTL_MS = 10 * 60 * 1000; // 10 minutos
@@ -2370,57 +2414,6 @@ async function transcodeToMp4(inputPath: string): Promise<string> {
   });
   return outPath;
 }
-// Helpers de proxy/IPv4 para Axios
-function parseProxyFromEnv(): { protocol: string; host: string; port: number; auth?: { username: string; password: string } } | null {
-  const raw = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-  if (!raw) return null;
-  try {
-    const u = new URL(raw);
-    return {
-      protocol: (u.protocol || 'http:').replace(':', ''),
-      host: u.hostname,
-      port: u.port ? Number(u.port) : 8080,
-      auth: u.username ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password || '') } : undefined,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function shouldBypassProxy(host: string, noProxyEnv?: string): boolean {
-  const list = (noProxyEnv || process.env.NO_PROXY || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (!list.length) return false;
-  return list.some(entry => {
-    if (entry === '*') return true;
-    if (entry.startsWith('.')) return host.endsWith(entry);
-    return host === entry || host.endsWith(`.${entry}`);
-  });
-}
-
-function resolveAxiosProxyFor(urlStr: string, client?: any) {
-  // 1) Preferir proxy do config.ts (se você adicionou algo como client.config.network.proxyUrl)
-  const cfgUrl = client?.config?.network?.proxyUrl || client?.config?.chatWoot?.proxyUrl;
-  const raw = cfgUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-  if (!raw) return null;
-
-  const target = new URL(urlStr);
-  if (shouldBypassProxy(target.hostname, client?.config?.network?.noProxy || process.env.NO_PROXY)) {
-    return 'bypass';
-  }
-
-  try {
-    const u = new URL(raw);
-    return {
-      protocol: (u.protocol || 'http:').replace(':', ''),
-      host: u.hostname,
-      port: u.port ? Number(u.port) : 8080,
-      auth: u.username ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password || '') } : undefined,
-    };
-  } catch {
-    return null;
-  }
-}
-
 
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
@@ -2477,6 +2470,17 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
 
       // Ajusta timeouts da Page/CDP para uploads grandes
       adjustPageTimeouts(client, req.logger);
+
+    // --- BOT TAG: ignora mensagens que começam com @arqos quando habilitado ---
+    const botTagEnabled = !!client?.config?.chatWoot?.bot_tag;
+    const rawText = (msg?.content || '').trimStart();
+    if (botTagEnabled && rawText.toLowerCase().startsWith('@arqos')) {
+      req.logger?.info?.('[chatwoot] mensagem com @arqos ignorada por bot_tag=true', {
+        message_id: cwMsgId,
+        phone,
+      });
+      return; // não envia para o WhatsApp
+    }
 
       // Assinatura (nome do atendente)
       const agentName =
@@ -2543,7 +2547,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
           url,
           filename: att?.filename,
           headers: maybeAuthHeaders(url),
-          client, // <-- passe o client para que o helper veja config/network/env
+          timeoutMs: att?.file_type === 'video' ? 300_000 : 180_000, // vídeo = +tempo
          });
 
         try {
