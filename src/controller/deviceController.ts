@@ -2468,6 +2468,34 @@ function isVideoAttachment(att: any, contentType?: string, name?: string) {
 }
 
 
+// Fallback para enviar vídeo via base64 (quando for o caso)
+async function sendVideoAsBase64(
+  client: any,
+  contato: string,
+  filePath: string,
+  filename: string,
+  caption: string,
+  mime: string
+) {
+  // garanta que vamos lidar com Buffer, não string
+  const rs = createReadStream(filePath);      // NÃO setar .setEncoding()
+  const chunks: Buffer[] = [];
+
+  await new Promise<void>((resolve, reject) => {
+    rs.on('data', (c: Buffer) => chunks.push(c));
+    rs.on('end', resolve);
+    rs.on('error', reject);
+  });
+
+  const buf: Buffer = Buffer.concat(chunks);        // <- agora é Buffer[]
+  const b64 = buf.toString('base64');
+  const dataUrl = `data:${mime};base64,${b64}`;
+
+  // use a API do cliente que aceite base64 (ajuste o método conforme seu client)
+  await withRetry(() => client.sendFileFromBase64(contato, dataUrl, filename, caption));
+}
+
+
 
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
@@ -2630,60 +2658,70 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
     }
 
     // VÍDEO (detecção robusta)
-    if (isVideoAttachment(att, contentType, filename)) {
-// já estamos dentro do if (isVideoAttachment(...)) { … }
+if (isVideoAttachment(att, contentType, filename)) {
+  let pathToSend: string = filePath;
+  let nameToSend: string =
+    (att?.filename && att.filename.trim()) || filename || 'video.mp4';
 
-let pathToSend = filePath;
-let nameToSend = (att?.filename && att.filename.trim()) || filename || 'video.mp4';
+  // Se não for claramente MP4, transcodifica para H.264/AAC
+  if (!isProbablyMp4Video(nameToSend, contentType)) {
+    req.logger?.info?.('[chatwoot] transcodificando vídeo → MP4 (H.264/AAC)…', {
+      filename: nameToSend,
+      contentType,
+    });
 
-// se não for claramente MP4, transcodifica
-if (!isProbablyMp4Video(nameToSend, contentType)) {
-  req.logger?.info?.('[chatwoot] transcodificando vídeo → MP4 (H.264/AAC)…', {
-    filename: nameToSend,
-    contentType,
-  });
-  const mp4Path = await transcodeToMp4(filePath);
-  pathToSend = mp4Path;
-  if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
-}
+    const mp4Path = await transcodeToMp4(filePath);
+    pathToSend = mp4Path;
+    if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
+  }
 
-req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
+  req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
 
-try {
-  // 1) tentativa por caminho de arquivo
-  for (const contato of destinos) {
-    const r = await withRetry(() =>
-      client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
+  try {
+    // 1) tentativa por caminho de arquivo
+    for (const contato of destinos) {
+      const r = await withRetry(() =>
+        client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
+      );
+      req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
+    }
+  } catch (err) {
+    req.logger?.error?.(
+      '[chatwoot] sendFile(video) falhou, tentando fallback base64…',
+      { err: String((err as any)?.message ?? err) }
     );
-    req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
-  }
-} catch (err) {
-  req.logger?.error?.('[chatwoot] sendFile(video) falhou, tentando fallback base64…', {
-    err: String((err as any)?.message ?? err),
-  });
 
-  // 2) fallback: envia por base64
-  const b64 = await new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    const s = createReadStream(pathToSend);
-    s.on('data', (c) => chunks.push(c));
-    s.on('error', reject);
-    s.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
-  });
+    // 2) fallback: envia por base64 (tipado corretamente em Buffer[])
+    const b64: string = await new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const s = createReadStream(pathToSend); // não definir encoding!
+      s.on('data', (c: Buffer) => chunks.push(c));
+      s.on('error', reject);
+      s.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+    });
 
-  for (const contato of destinos) {
-    const r = await withRetry(() =>
-      client.sendFile(`${contato}`, `data:video/mp4;base64,${b64}`, nameToSend, caption)
-    );
-    req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato, result: r });
+    const mime = contentType && contentType.startsWith('video/')
+      ? contentType
+      : 'video/mp4';
+
+    for (const contato of destinos) {
+      const dataUrl = `data:${mime};base64,${b64}`;
+      const r = await withRetry(() =>
+        client.sendFile(`${contato}`, dataUrl, nameToSend, caption)
+      );
+      req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', {
+        to: contato,
+        result: r,
+      });
+    }
+  } finally {
+    // se houve transcode, apaga o arquivo gerado
+    if (pathToSend !== filePath) {
+      try { unlinkSync(pathToSend); } catch {}
+    }
   }
-} finally {
-  // se houve transcode, apaga o arquivo gerado
-  if (pathToSend !== filePath) {
-    try { unlinkSync(pathToSend); } catch {}
-  }
- }
-return;
+
+  return;
 }
 
     // OUTROS TIPOS (imagem, pdf, etc)
