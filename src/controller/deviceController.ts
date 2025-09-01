@@ -2482,23 +2482,6 @@ async function withCap<T>(factory: () => Promise<T>, ms = 120_000): Promise<T> {
   }
 }
 
-// Concatena stream em Buffer e devolve base64 (TIPADO e sem retornar number)
-async function streamFileToBase64(filePath: string): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    const rs = createReadStream(filePath); // NÃO defina .setEncoding()
-
-    rs.on('data', (c: Buffer) => {          // <— note as chaves { } para não retornar number
-      chunks.push(c);
-    });
-    rs.once('error', reject);
-    rs.once('end', () => {
-      try {
-        resolve(Buffer.concat(chunks).toString('base64'));
-      } catch (e) { reject(e); }
-    });
-  });
-}
 
 // Log “enxuto” do retorno do WPP para não poluir
 function summarizeSend(ret: any) {
@@ -2516,11 +2499,32 @@ async function sendVideoAsBase64(opts: {
   mime: string; // ex: 'video/mp4'
 }) {
   const { client, contato, filePath, filename, caption, mime } = opts;
-  const b64 = await streamFileToBase64(filePath);
+  const b64 = await fileToBase64(filePath);
   const dataUrl = `data:${mime};base64,${b64}`;
   await withRetry(() => client.sendFile(`${contato}`, dataUrl, filename, caption));
 }
+// Concatena stream de arquivo em base64 (tolerante a string|Buffer)
+async function fileToBase64(filePath: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const rs = createReadStream(filePath); // NÃO defina .setEncoding()
 
+    rs.on('data', (chunk: unknown) => {        // aceita string | Buffer
+      if (Buffer.isBuffer(chunk)) {
+        chunks.push(chunk);
+      } else {
+        // se vier string por algum motivo, converte
+        chunks.push(Buffer.from(String(chunk)));
+      }
+    });
+    rs.once('error', reject);
+    rs.once('end', () => {
+      try {
+        resolve(Buffer.concat(chunks).toString('base64'));
+      } catch (e) { reject(e); }
+    });
+  });
+}
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
 export async function chatWoot(req: Request, res: Response): Promise<any> {
@@ -2719,16 +2723,7 @@ if (isVideoAttachment(att, contentType, filename)) {
       contentType && contentType.startsWith('video/') ? contentType : 'video/mp4';
 
     // Lê o arquivo (sem encoding) -> Buffer[] -> base64
-    const b64: string = await (async () => {
-      const rs = createReadStream(pathToSend); // NÃO definir .setEncoding()
-      const chunks: Buffer[] = [];
-      await new Promise<void>((resolve, reject) => {
-        rs.on('data', (c: Buffer) => chunks.push(c));
-        rs.on('end', resolve);
-        rs.on('error', reject);
-      });
-      return Buffer.concat(chunks).toString('base64');
-    })();
+    const b64: string = await fileToBase64(pathToSend);
 
     const dataUrl = `data:${mime};base64,${b64}`;
 
