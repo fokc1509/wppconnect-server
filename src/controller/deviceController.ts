@@ -21,7 +21,7 @@ import { clientsArray } from '../util/sessionUtil';
 
 
 import axios from 'axios';
-import { createWriteStream, createReadStream, mkdtempSync, unlinkSync } from 'fs';
+import { createWriteStream, createReadStream, mkdtempSync, unlinkSync, statSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { pipeline } from 'node:stream/promises';
@@ -2467,18 +2467,45 @@ function isVideoAttachment(att: any, contentType?: string, name?: string) {
   return false;
 }
 
-// Lê um arquivo e devolve base64 (sempre Buffer[], sem .setEncoding)
+// Timeout lógico para qualquer promise (não substitui os timeouts do Puppeteer)
+async function withCap<T>(factory: () => Promise<T>, ms = 120_000): Promise<T> {
+  let t: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race<T>([
+      factory(),
+      new Promise<T>((_, rej) => {
+        t = setTimeout(() => rej(new Error('TimeoutCap')), ms);
+      }),
+    ]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
+// Concatena stream em Buffer e devolve base64 (TIPADO e sem retornar number)
 async function streamFileToBase64(filePath: string): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    const rs = createReadStream(filePath); // NÃO definir .setEncoding()
+    const rs = createReadStream(filePath); // NÃO defina .setEncoding()
 
-    rs.on('data', (c: Buffer | string): void => { chunks.push(c as Buffer); });
+    rs.on('data', (c: Buffer) => {          // <— note as chaves { } para não retornar number
+      chunks.push(c);
+    });
     rs.once('error', reject);
-    rs.once('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+    rs.once('end', () => {
+      try {
+        resolve(Buffer.concat(chunks).toString('base64'));
+      } catch (e) { reject(e); }
+    });
   });
 }
 
+// Log “enxuto” do retorno do WPP para não poluir
+function summarizeSend(ret: any) {
+  if (!ret) return ret;
+  const { id, ack, to, mimetype, type } = ret as any;
+  return { id, ack, to, mimetype, type };
+}
 // Envia vídeo como data URL (fallback)
 async function sendVideoAsBase64(opts: {
   client: any;
@@ -2493,6 +2520,13 @@ async function sendVideoAsBase64(opts: {
   const dataUrl = `data:${mime};base64,${b64}`;
   await withRetry(() => client.sendFile(`${contato}`, dataUrl, filename, caption));
 }
+
+function summarizeSend(ret: any) {
+  if (!ret) return ret;
+  const { id, ack, to, mimetype, type } = ret as any;
+  return { id, ack, to, mimetype, type };
+}
+
 
 
 // =================== FIM HELPERS (Topo do arquivo) ===================
@@ -2655,7 +2689,7 @@ export async function chatWoot(req: Request, res: Response): Promise<any> {
       return;
     }
 
-    // VÍDEO (detecção robusta)
+// ====================== VÍDEO ======================
 if (isVideoAttachment(att, contentType, filename)) {
   let pathToSend: string = filePath;
   let nameToSend: string =
@@ -2667,62 +2701,124 @@ if (isVideoAttachment(att, contentType, filename)) {
       filename: nameToSend,
       contentType,
     });
-
     const mp4Path = await transcodeToMp4(filePath);
     pathToSend = mp4Path;
     if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
   }
 
-req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
+  req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
 
-try {
-  // 1) tentativa por caminho de arquivo
-  for (const contato of destinos) {
-    const r = await withRetry(() =>
-      client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
-    );
-    req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
-  }
-} catch (err) {
-  req.logger?.error?.(
-    '[chatwoot] sendFile(video) falhou, tentando fallback base64…',
-    { err: String((err as any)?.message ?? err) }
-  );
-
-  // 2) fallback: envia como base64
-  const mime = contentType && contentType.startsWith('video/')
-    ? contentType
-    : 'video/mp4';
-
-  for (const contato of destinos) {
-    await sendVideoAsBase64({
-      client,
-      contato,
-      filePath: pathToSend,     // usa o transcodificado se existiu
-      filename: nameToSend,
-      caption,
-      mime,
-    });
-    req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato });
-  }
-} finally {
-  // se houve transcode, apaga o arquivo gerado
-  if (pathToSend !== filePath) {
-    try { unlinkSync(pathToSend); } catch {}
-  }
-}
-return;
-}
-
-    // OUTROS TIPOS (imagem, pdf, etc)
-    const name = (att?.filename && att.filename.trim()) || filename || 'file';
-    req.logger?.info?.('[chatwoot] enviando arquivo genérico…', { name, contentType });
+  try {
+    // 1) tentativa direta por caminho de arquivo
     for (const contato of destinos) {
-      await withRetry(() => client.sendFile(`${contato}`, filePath, name, caption));
+      const r = await withRetry(() =>
+        client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
+      );
+      req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
+    }
+  } catch (err) {
+    req.logger?.error?.(
+      '[chatwoot] sendFile(video) falhou, tentando fallback base64…',
+      { err: String((err as any)?.message ?? err) }
+    );
+
+    // 2) fallback: prepara base64 uma única vez
+    const mime =
+      contentType && contentType.startsWith('video/') ? contentType : 'video/mp4';
+
+    // Lê o arquivo (sem encoding) -> Buffer[] -> base64
+    const b64: string = await (async () => {
+      const rs = createReadStream(pathToSend); // NÃO definir .setEncoding()
+      const chunks: Buffer[] = [];
+      await new Promise<void>((resolve, reject) => {
+        rs.on('data', (c: Buffer) => chunks.push(c));
+        rs.on('end', resolve);
+        rs.on('error', reject);
+      });
+      return Buffer.concat(chunks).toString('base64');
+    })();
+
+    const dataUrl = `data:${mime};base64,${b64}`;
+
+    // Tenta várias formas porque mudam entre versões do WPPConnect
+    for (const contato of destinos) {
+      let delivered = false;
+      let lastErr: any;
+
+      const attempts: Array<[string, (() => Promise<any>) | undefined]> = [
+        [
+          'sendVideoFromBase64(pureB64)',
+          (client as any)?.sendVideoFromBase64
+            ? () => (client as any).sendVideoFromBase64(`${contato}`, b64, nameToSend, caption)
+            : undefined,
+        ],
+        [
+          'sendFileFromBase64(dataURL)',
+          (client as any)?.sendFileFromBase64
+            ? () => (client as any).sendFileFromBase64(`${contato}`, dataUrl, nameToSend, caption)
+            : undefined,
+        ],
+        [
+          'sendFile(dataURL)',
+          () => client.sendFile(`${contato}`, dataUrl, nameToSend, caption),
+        ],
+        [
+          'sendFile(pureB64, mime)',
+          // algumas builds aceitam base64 puro + mimetype como 5º arg
+          () => (client as any).sendFile(`${contato}`, b64, nameToSend, caption, mime),
+        ],
+      ];
+
+      for (const [label, call] of attempts) {
+        if (!call) {
+          req.logger?.info?.(`[chatwoot] ${label} indisponível; pulando`, { to: contato });
+          continue;
+        }
+        try {
+          const r = await withRetry(call);
+          req.logger?.info?.(`[chatwoot] ${label} OK`, { to: contato, result: r });
+          delivered = true;
+          break;
+        } catch (e: any) {
+          lastErr = e;
+          req.logger?.warn?.(`[chatwoot] ${label} falhou`, {
+            to: contato,
+            err: String(e?.message ?? e),
+          });
+        }
+      }
+
+      if (!delivered) {
+        req.logger?.error?.('[chatwoot] falha ao enviar vídeo via base64 (todas as tentativas)', {
+          to: contato,
+          err: String(lastErr?.message ?? lastErr),
+          mime,
+          nameToSend,
+        });
+      } else {
+        req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato });
+      }
     }
   } finally {
-    cleanup();
+    // se houve transcode, apaga o arquivo gerado
+    if (pathToSend !== filePath) {
+      try {
+        unlinkSync(pathToSend);
+      } catch {}
+    }
   }
+  return;
+}
+
+// ====================== OUTROS TIPOS (imagem, pdf, etc) ======================
+const name = (att?.filename && att.filename.trim()) || filename || 'file';
+req.logger?.info?.('[chatwoot] enviando arquivo genérico…', { name, contentType });
+for (const contato of destinos) {
+  await withRetry(() => client.sendFile(`${contato}`, filePath, name, caption));
+}
+} finally {
+  cleanup();
+}
 } else {
   // Texto puro
   for (const contato of destinos) {
@@ -2730,12 +2826,6 @@ return;
   }
 }
 
-    } catch (err: any) {
-      try { req.logger?.error?.('chatWoot async send error:', err); } catch {}
-      console.error('chatWoot async send error:', err);
-    }
-  });
-}
 
 // ===================== FIM FUNCAO CHATWOOT =====================
 
