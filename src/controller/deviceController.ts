@@ -30,6 +30,7 @@ import { spawn } from 'child_process'; // <— adicione este import
 import http from 'node:http';
 import https from 'node:https';
 import * as dns from 'node:dns';                // <-- importe como namespace
+import { pipeline } from 'node:stream/promises';
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
   res.status(201).json({
@@ -2226,12 +2227,8 @@ export async function getVotes(req: Request, res: Response) {
 }
 // FUNCOES CHATWOOT
 // ========== helper robusto para download (IPv4, keepalive, redirect-safe, proxy-aware) ==========
-const lookup4 = (
-  hostname: string,
-  _opts: any,
-  cb: (err: NodeJS.ErrnoException | null, address: string, family?: number) => void
-) => {
-  dns.lookup(hostname, { family: 4, all: false }, cb as any);
+const lookup4: any = (hostname: string, _opts: any, cb: any) => {
+  (dns as any).lookup(hostname, { family: 4, all: false }, cb);
 };
 
 const httpAgentKA = new http.Agent({ keepAlive: true, maxSockets: 12, scheduling: 'lifo' as any });
@@ -2262,44 +2259,71 @@ function shouldBypassProxy(urlStr: string): boolean {
   } catch { return false; }
 }
 
-async function axiosGetStream(url: string, timeoutMs: number, extraHeaders?: Record<string, string>) {
+// GET de stream com IPv4, keep-alive, redirect-safe e respeito a NO_PROXY
+async function axiosGetStream(
+  url: string,
+  timeoutMs: number,
+  extraHeaders?: Record<string, string>
+) {
   const useProxy = !shouldBypassProxy(url);
-  // O Axios 1.x usa follow-redirects; precisamos re-aplicar lookup/agents em cada redirect
-  return axios({
+
+  // Observação: alguns campos (lookup/beforeRedirect/decompress) não estão nos types do axios,
+  // por isso usamos "as any" e // @ts-ignore onde necessário.
+  return axios.request({
     method: 'GET',
     url,
     responseType: 'stream',
     timeout: timeoutMs,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity,
-    // importantíssimo: plugar lookup IPv4 e keepalive agentes
+
+    // limites grandes pra anexos
+    maxContentLength: Infinity as any,
+    maxBodyLength: Infinity as any,
+
+    // agentes com keep-alive
     httpAgent: httpAgentKA,
     httpsAgent: httpsAgentKA,
-    // Axios expõe follow-redirects options:
+
+    // segue até 5 redirects (o follow-redirects cuida do 3xx)
     maxRedirects: 5,
-    // @ts-ignore
-    lookup: lookup4, // para a 1a requisição (follow-redirects também usa de base)
-    // @ts-ignore
-    beforeRedirect: (options: any, _responseDetails: any) => {
-      // re-aplica tudo a cada hop
+
+    // forçar IPv4 no primeiro hop…
+    // @ts-ignore - não tipado em AxiosRequestConfig
+    lookup: lookup4,
+
+    // …e reaplicar em cada redirect
+    // @ts-ignore - hook de follow-redirects
+    beforeRedirect: (options: any /*, responseDetails: any */) => {
       options.lookup = lookup4;
       options.agents = { http: httpAgentKA, https: httpsAgentKA };
       options.agent = options.protocol === 'http:' ? httpAgentKA : httpsAgentKA;
-      // se estiver usando proxy no ambiente, deixe o follow-redirects decidir; se quiser
-      // FORÇAR bypass nesse host, já tratamos com NO_PROXY acima
+
+      // se você precisar preservar/ajustar headers a cada hop:
+      if (!options.headers) options.headers = {};
+      // Evita carregar um Host incorreto entre domínios
+      delete options.headers.host;
+      // Mantém UA e Accept
+      options.headers['User-Agent'] ??= 'wppconnect-media-fetch/1.0';
+      options.headers['Accept'] ??= '*/*';
     },
+
     headers: {
       'User-Agent': 'wppconnect-media-fetch/1.0',
-      'Accept': '*/*',
+      Accept: '*/*',
       ...(extraHeaders || {}),
     },
-    // Se você estiver usando axios proxy nativo e quiser desativar quando NO_PROXY casar:
-    proxy: useProxy ? undefined : false,
-    decompress: true,
+
+    // Se NO_PROXY casar, desligamos o proxy do axios
+    ...(useProxy ? {} : { proxy: false }),
+
+    // gzip/br automáticos
+    decompress: true as any,
+
     transitional: { clarifyTimeoutError: true },
-    validateStatus: s => s >= 200 && s < 400, // aceita 3xx para o follow-redirects
-  });
+
+    validateStatus: (s: number) => s >= 200 && s < 400, // aceita 3xx; follow-redirects resolve
+  } as any);
 }
+
 
 export async function downloadToTemp(opts: {
   url: string;
