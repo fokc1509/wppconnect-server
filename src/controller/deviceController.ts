@@ -29,7 +29,7 @@ import { randomUUID } from 'crypto';
 import { spawn } from 'child_process'; // <— adicione este import
 import http from 'node:http';
 import https from 'node:https';
-import * as dns from 'node:dns';                // <-- importe como namespace
+
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
   res.status(201).json({
@@ -2266,8 +2266,6 @@ async function axiosGetStream(
 ) {
   const useProxy = !shouldBypassProxy(url);
 
-  // Observação: alguns campos (lookup/beforeRedirect/decompress) não estão nos types do axios,
-  // por isso usamos "as any" e // @ts-ignore onde necessário.
   return axios.request({
     method: 'GET',
     url,
@@ -2278,31 +2276,35 @@ async function axiosGetStream(
     maxContentLength: Infinity as any,
     maxBodyLength: Infinity as any,
 
-    // agentes com keep-alive
+    // força IPv4 sem usar hook de lookup (evita ERR_INVALID_IP_ADDRESS)
+    family: 4 as any,
+
+    // agentes keep-alive
     httpAgent: httpAgentKA,
     httpsAgent: httpsAgentKA,
 
-    // segue até 5 redirects (o follow-redirects cuida do 3xx)
+    // segue redirects
     maxRedirects: 5,
 
-    // forçar IPv4 no primeiro hop…
-    // @ts-ignore - não tipado em AxiosRequestConfig
-    lookup: lookup4,
-
-    // …e reaplicar em cada redirect
-    // @ts-ignore - hook de follow-redirects
-    beforeRedirect: (options: any /*, responseDetails: any */) => {
-      options.lookup = lookup4;
+    // reaplica IPv4/agents a cada hop e saneia headers/opções
+    // @ts-ignore follow-redirects hook
+    beforeRedirect: (options: any /* , responseDetails: any */) => {
+      // força IPv4 também nos hops seguintes
+      options.family = 4;
       options.agents = { http: httpAgentKA, https: httpsAgentKA };
       options.agent = options.protocol === 'http:' ? httpAgentKA : httpsAgentKA;
 
-      // se você precisar preservar/ajustar headers a cada hop:
-      if (!options.headers) options.headers = {};
-      // Evita carregar um Host incorreto entre domínios
-      delete options.headers.host;
-      // Mantém UA e Accept
-      options.headers['User-Agent'] ??= 'wppconnect-media-fetch/1.0';
-      options.headers['Accept'] ??= '*/*';
+      // se algum middleware setou localAddress inválido, remova
+      if (!options.localAddress || typeof options.localAddress !== 'string' || !options.localAddress.trim()) {
+        delete options.localAddress;
+      }
+
+      // evite carregar Host incorreto ao mudar de domínio
+      if (options.headers) {
+        delete options.headers.host;
+        options.headers['User-Agent'] ??= 'wppconnect-media-fetch/1.0';
+        options.headers['Accept'] ??= '*/*';
+      }
     },
 
     headers: {
@@ -2311,7 +2313,7 @@ async function axiosGetStream(
       ...(extraHeaders || {}),
     },
 
-    // Se NO_PROXY casar, desligamos o proxy do axios
+    // Se NO_PROXY casar, desligamos o proxy nativo do axios
     ...(useProxy ? {} : { proxy: false }),
 
     // gzip/br automáticos
@@ -2319,7 +2321,8 @@ async function axiosGetStream(
 
     transitional: { clarifyTimeoutError: true },
 
-    validateStatus: (s: number) => s >= 200 && s < 400, // aceita 3xx; follow-redirects resolve
+    // aceita 2xx/3xx; o follow-redirects lida com 3xx
+    validateStatus: (s: number) => s >= 200 && s < 400,
   } as any);
 }
 
