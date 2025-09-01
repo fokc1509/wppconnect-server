@@ -27,6 +27,7 @@ import { join } from 'path';
 import { spawn } from 'child_process'; 
 import * as os from 'os';
 import * as path from 'path';
+import { promises as fsp } from 'node:fs';
 
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
@@ -2223,12 +2224,7 @@ export async function getVotes(req: Request, res: Response) {
   }
 }
 // FUNCOES CHATWOOT
-// ========== helper robusto para download (IPv4, keepalive, redirect-safe, proxy-aware) ==========
 // === HELPERS MÍNIMOS PARA CHATWOOT ===
-
-import { spawn } from 'node:child_process';
-import { createReadStream } from 'node:fs';
-import { promises as fsp } from 'node:fs';
 
 // Ajuste de timeouts da Page/CDP (Puppeteer)
 export function adjustPageTimeouts(client: any, logger?: any) {
