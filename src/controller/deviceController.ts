@@ -2467,38 +2467,33 @@ function isVideoAttachment(att: any, contentType?: string, name?: string) {
   return false;
 }
 
+// Lê um arquivo e devolve base64 (sempre Buffer[], sem .setEncoding)
+async function streamFileToBase64(filePath: string): Promise<string> {
+  return await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const rs = createReadStream(filePath); // NÃO definir .setEncoding()
 
-// Fallback para enviar vídeo via base64 (quando for o caso)
+    rs.on('data', (c: Buffer | string): void => { chunks.push(c as Buffer); });
+    rs.once('error', reject);
+    rs.once('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+  });
+}
+
+// Envia vídeo como data URL (fallback)
 async function sendVideoAsBase64(opts: {
   client: any;
   contato: string;
   filePath: string;
   filename: string;
   caption: string;
-  mime?: string; // default 'video/mp4'
+  mime: string; // ex: 'video/mp4'
 }) {
-  const { client, contato, filePath, filename, caption, mime = 'video/mp4' } = opts;
-
+  const { client, contato, filePath, filename, caption, mime } = opts;
   const b64 = await streamFileToBase64(filePath);
   const dataUrl = `data:${mime};base64,${b64}`;
-
-  await withRetry(() =>
-    // se seu client aceita data URL no sendFile, use sendFile; se tiver sendFileFromBase64, troque aqui:
-    client.sendFile(`${contato}`, dataUrl, filename, caption)
-  );
+  await withRetry(() => client.sendFile(`${contato}`, dataUrl, filename, caption));
 }
 
-
-async function streamFileToBase64(filePath: string): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = [];           // <- sempre Buffer[]
-    const rs = createReadStream(filePath); // NÃO defina .setEncoding()
-
-    rs.on('data', (c: Buffer) => chunks.push(c));
-    rs.once('error', reject);
-    rs.once('end', () => resolve(Buffer.concat(chunks).toString('base64')));
-  });
-}
 
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
@@ -2678,31 +2673,32 @@ if (isVideoAttachment(att, contentType, filename)) {
     if (!nameToSend.toLowerCase().endsWith('.mp4')) nameToSend += '.mp4';
   }
 
-  req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
+req.logger?.info?.('[chatwoot] enviando vídeo MP4…', { nameToSend, pathToSend });
 
-  try {
-    // 1) tentativa por caminho de arquivo
-    for (const contato of destinos) {
-      const r = await withRetry(() =>
-        client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
-      );
-      req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
-    }
+try {
+  // 1) tentativa por caminho de arquivo
+  for (const contato of destinos) {
+    const r = await withRetry(() =>
+      client.sendFile(`${contato}`, pathToSend, nameToSend, caption)
+    );
+    req.logger?.info?.('[chatwoot] sendFile(video) ok', { to: contato, result: r });
+  }
 } catch (err) {
-  req.logger?.error?.('[chatwoot] sendFile(video) falhou, tentando fallback base64…', {
-    err: String((err as any)?.message ?? err),
-  });
+  req.logger?.error?.(
+    '[chatwoot] sendFile(video) falhou, tentando fallback base64…',
+    { err: String((err as any)?.message ?? err) }
+  );
 
-  const mime =
-    contentType && contentType.startsWith('video/')
-      ? contentType
-      : 'video/mp4';
+  // 2) fallback: envia como base64
+  const mime = contentType && contentType.startsWith('video/')
+    ? contentType
+    : 'video/mp4';
 
   for (const contato of destinos) {
     await sendVideoAsBase64({
       client,
       contato,
-      filePath: pathToSend,
+      filePath: pathToSend,     // usa o transcodificado se existiu
       filename: nameToSend,
       caption,
       mime,
@@ -2710,13 +2706,12 @@ if (isVideoAttachment(att, contentType, filename)) {
     req.logger?.info?.('[chatwoot] sendFile(video, base64) ok', { to: contato });
   }
 } finally {
-    // se houve transcode, apaga o arquivo gerado
-    if (pathToSend !== filePath) {
-      try { unlinkSync(pathToSend); } catch {}
-    }
+  // se houve transcode, apaga o arquivo gerado
+  if (pathToSend !== filePath) {
+    try { unlinkSync(pathToSend); } catch {}
   }
-
-  return;
+}
+return;
 }
 
     // OUTROS TIPOS (imagem, pdf, etc)
