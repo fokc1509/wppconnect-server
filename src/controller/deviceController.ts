@@ -29,6 +29,8 @@ import { randomUUID } from 'crypto';
 import { spawn } from 'child_process'; // <— adicione este import
 import http from 'node:http';
 import https from 'node:https';
+import * as dns from 'node:dns';
+import * as net from 'node:net';
 
 
 function returnSucess(res: any, session: any, phone: any, data: any) {
@@ -2226,9 +2228,23 @@ export async function getVotes(req: Request, res: Response) {
 }
 // FUNCOES CHATWOOT
 // ========== helper robusto para download (IPv4, keepalive, redirect-safe, proxy-aware) ==========
-const lookup4: any = (hostname: string, _opts: any, cb: any) => {
-  (dns as any).lookup(hostname, { family: 4, all: false }, cb);
+// força IPv4, mas sem quebrar se chamarem sem hostname
+const lookup4: any = (hostname: any, _opts: any, cb: any) => {
+  try {
+    if (!hostname || typeof hostname !== 'string') {
+      // devolve erro “leve” para a stack superior tratar como falha de rede
+      return process.nextTick(() => cb(Object.assign(new Error('EINVAL_HOSTNAME'), { code: 'EINVAL_HOSTNAME' }), null, 4));
+    }
+    // se já vier um IP, devolve direto
+    if (net.isIP(hostname)) {
+      return process.nextTick(() => cb(null, hostname, 4));
+    }
+    (dns as any).lookup(hostname, { family: 4, all: false }, cb);
+  } catch (e) {
+    return cb(e, null, 4);
+  }
 };
+
 
 const httpAgentKA = new http.Agent({ keepAlive: true, maxSockets: 12, scheduling: 'lifo' as any });
 const httpsAgentKA = new https.Agent({
@@ -2258,72 +2274,52 @@ function shouldBypassProxy(urlStr: string): boolean {
   } catch { return false; }
 }
 
-// GET de stream com IPv4, keep-alive, redirect-safe e respeito a NO_PROXY
-async function axiosGetStream(
-  url: string,
-  timeoutMs: number,
-  extraHeaders?: Record<string, string>
-) {
+async function axiosGetStream(url: string, timeoutMs: number, extraHeaders?: Record<string, string>) {
   const useProxy = !shouldBypassProxy(url);
 
-  return axios.request({
+  return axios({
     method: 'GET',
     url,
     responseType: 'stream',
     timeout: timeoutMs,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
 
-    // limites grandes pra anexos
-    maxContentLength: Infinity as any,
-    maxBodyLength: Infinity as any,
+    // preferir IPv4 sem depender do lookup custom se a lib não chamar
+    // (Node http/https aceita 'family' diretamente)
+    // @ts-ignore
+    family: 4,
 
-    // força IPv4 sem usar hook de lookup (evita ERR_INVALID_IP_ADDRESS)
-    family: 4 as any,
-
-    // agentes keep-alive
     httpAgent: httpAgentKA,
     httpsAgent: httpsAgentKA,
 
-    // segue redirects
     maxRedirects: 5,
 
-    // reaplica IPv4/agents a cada hop e saneia headers/opções
-    // @ts-ignore follow-redirects hook
-    beforeRedirect: (options: any /* , responseDetails: any */) => {
-      // força IPv4 também nos hops seguintes
+    // siga usando o lookup4, mas ele já está resiliente
+    // @ts-ignore
+    lookup: lookup4,
+
+    // garantir que cada redirect herde o setup
+    // @ts-ignore
+    beforeRedirect: (options: any) => {
       options.family = 4;
+      options.lookup = lookup4;
       options.agents = { http: httpAgentKA, https: httpsAgentKA };
       options.agent = options.protocol === 'http:' ? httpAgentKA : httpsAgentKA;
-
-      // se algum middleware setou localAddress inválido, remova
-      if (!options.localAddress || typeof options.localAddress !== 'string' || !options.localAddress.trim()) {
-        delete options.localAddress;
-      }
-
-      // evite carregar Host incorreto ao mudar de domínio
-      if (options.headers) {
-        delete options.headers.host;
-        options.headers['User-Agent'] ??= 'wppconnect-media-fetch/1.0';
-        options.headers['Accept'] ??= '*/*';
-      }
     },
 
     headers: {
       'User-Agent': 'wppconnect-media-fetch/1.0',
-      Accept: '*/*',
+      'Accept': '*/*',
       ...(extraHeaders || {}),
     },
 
-    // Se NO_PROXY casar, desligamos o proxy nativo do axios
-    ...(useProxy ? {} : { proxy: false }),
-
-    // gzip/br automáticos
-    decompress: true as any,
-
+    // se NO_PROXY casar, desliga proxy do axios
+    proxy: useProxy ? undefined : false,
+    decompress: true,
     transitional: { clarifyTimeoutError: true },
-
-    // aceita 2xx/3xx; o follow-redirects lida com 3xx
-    validateStatus: (s: number) => s >= 200 && s < 400,
-  } as any);
+    validateStatus: (s) => s >= 200 && s < 400,
+  });
 }
 
 
