@@ -2300,6 +2300,47 @@ async function transcodeToMp4(inputPath: string): Promise<string> {
   });
   return outPath;
 }
+async function downloadToTemp(opts: {
+  url: string;
+  filename?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+}) {
+  const { url, filename, headers, timeoutMs = 120000 } = opts;
+
+  const resp = await axios({
+    method: 'GET',
+    url,
+    responseType: 'stream',
+    timeout: timeoutMs,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+    headers,
+    validateStatus: (s) => s >= 200 && s < 400, // aceita redirects
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), 'wpp-'));
+  const name =
+    filename ||
+    url.split('?')[0].split('/').pop() ||
+    `file-${randomUUID()}`;
+  const filePath = join(dir, name);
+
+  await pipeline(resp.data, createWriteStream(filePath));
+
+  const contentType = resp.headers['content-type'] || '';
+  return {
+    filePath,
+    filename: name,
+    contentType,
+    cleanup: () => {
+      try {
+        unlinkSync(filePath);
+      } catch {}
+    },
+  };
+}
+
 // =================== FIM HELPERS (Topo do arquivo) ===================
 // ===================== FUNCAO CHATWOOT =====================
 export async function chatWoot(req: Request, res: Response): Promise<any> {
