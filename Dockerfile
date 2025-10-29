@@ -1,4 +1,7 @@
-FROM node:22.18.0-alpine AS base
+<<<<<<< HEAD
+=======
+FROM node:22.20.0-alpine AS base
+>>>>>>> upstream/main
 WORKDIR /usr/src/wpp-server
 ENV NODE_ENV=production PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 COPY package.json ./
