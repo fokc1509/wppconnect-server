@@ -1,5 +1,3 @@
-<<<<<<< HEAD
-=======
 FROM node:22.20.0-alpine AS base
 >>>>>>> upstream/main
 WORKDIR /usr/src/wpp-server
